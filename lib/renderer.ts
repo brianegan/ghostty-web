@@ -608,11 +608,9 @@ export class CanvasRenderer {
     if (cell.flags & CellFlags.BOLD) fontStyle += 'bold ';
     this.ctx.font = `${fontStyle}${this.fontSize}px ${this.fontFamily}`;
 
-    // Set text color - use override, selection foreground, or normal color
+    // Set text color - use override or normal color (selection keeps original fg)
     if (colorOverride) {
       this.ctx.fillStyle = colorOverride;
-    } else if (isSelected) {
-      this.ctx.fillStyle = this.theme.selectionForeground;
     } else {
       // Extract colors and handle inverse
       let fg_r = cell.fg_r,
