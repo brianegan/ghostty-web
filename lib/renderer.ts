@@ -538,19 +538,22 @@ export class CanvasRenderer {
     if (hyperlinkChanged) {
       // Find rows containing the old or new hovered hyperlink
       // Must check the correct buffer based on viewportY (scrollback vs screen)
+      // Floor viewportY once: the scrollback/screen boundary and the offset math
+      // must use the same integer, otherwise fractional values (during smooth
+      // scroll) read one row past the scrollback and drop the top screen row.
+      const flooredViewportY = Math.floor(viewportY);
       for (let y = 0; y < dims.rows; y++) {
         let line: GhosttyCell[] | null = null;
 
         // Same logic as rendering: fetch from scrollback or screen
-        if (viewportY > 0) {
-          if (y < viewportY && scrollbackProvider) {
+        if (flooredViewportY > 0) {
+          if (y < flooredViewportY && scrollbackProvider) {
             // This row is from scrollback
-            // Floor viewportY for array access (handles fractional values during smooth scroll)
-            const scrollbackOffset = scrollbackLength - Math.floor(viewportY) + y;
+            const scrollbackOffset = scrollbackLength - flooredViewportY + y;
             line = scrollbackProvider.getScrollbackLine(scrollbackOffset);
           } else {
             // This row is from visible screen
-            const screenRow = y - Math.floor(viewportY);
+            const screenRow = y - flooredViewportY;
             line = buffer.getLine(screenRow);
           }
         } else {
@@ -622,6 +625,14 @@ export class CanvasRenderer {
       }
     }
 
+    // Floor viewportY once for row mapping. The scrollback/screen boundary
+    // comparison and the offset/screenRow math must use the SAME integer.
+    // During smooth scroll viewportY is fractional (e.g. 2.5); comparing rows
+    // against the raw value while indexing with the floored value read one row
+    // past the end of scrollback (returning null, leaving stale pixels) and
+    // dropped the top screen row, duplicating a line near the top of the view.
+    const flooredViewportY = Math.floor(viewportY);
+
     // Render each line
     for (let y = 0; y < dims.rows; y++) {
       if (!rowsToRender.has(y)) {
@@ -632,21 +643,20 @@ export class CanvasRenderer {
 
       // Fetch line from scrollback or visible screen
       let line: GhosttyCell[] | null = null;
-      if (viewportY > 0) {
+      if (flooredViewportY > 0) {
         // Scrolled up - need to fetch from scrollback + visible screen
         // When scrolled up N lines, we want to show:
         // - Scrollback lines (from the end) + visible screen lines
 
         // Check if this row should come from scrollback or visible screen
-        if (y < viewportY && scrollbackProvider) {
+        if (y < flooredViewportY && scrollbackProvider) {
           // This row is from scrollback (upper part of viewport)
           // Get from end of scrollback buffer
-          // Floor viewportY for array access (handles fractional values during smooth scroll)
-          const scrollbackOffset = scrollbackLength - Math.floor(viewportY) + y;
+          const scrollbackOffset = scrollbackLength - flooredViewportY + y;
           line = scrollbackProvider.getScrollbackLine(scrollbackOffset);
         } else {
           // This row is from visible screen (lower part of viewport)
-          const screenRow = viewportY > 0 ? y - Math.floor(viewportY) : y;
+          const screenRow = y - flooredViewportY;
           line = buffer.getLine(screenRow);
         }
       } else {
@@ -813,9 +823,6 @@ export class CanvasRenderer {
       return;
     }
 
-    // Check if this cell is selected
-    const isSelected = this.isInSelection(x, y);
-
     // Set text style
     let fontStyle = '';
     if (cell.flags & CellFlags.ITALIC) fontStyle += 'italic ';
@@ -834,11 +841,12 @@ export class CanvasRenderer {
       fg_b = cell.bg_b;
     }
 
-    // Set text color - use override if provided, otherwise selection or cell color
+    // Set text color - use override or cell color. Selected text keeps its
+    // original foreground rather than being forced to theme.selectionForeground,
+    // so VS Code theme colors survive selection (helper customization, ports
+    // "Don't force the selection color").
     if (colorOverride) {
       this.ctx.fillStyle = colorOverride;
-    } else if (isSelected) {
-      this.ctx.fillStyle = this.theme.selectionForeground;
     } else {
       // Same reasoning as the bg path: only fall back to theme.foreground
       // when the cell has the default fg (tag NONE), not when its explicit
@@ -954,64 +962,136 @@ export class CanvasRenderer {
   ): boolean {
     const height = this.metrics.height;
 
+    // Snap a coordinate to the device-pixel grid. The cell edges are already
+    // device-aligned (metrics are rounded to 1/dpr), but the internal split
+    // points of partial blocks (height/2, cellWidth*3/8, ...) are not. On a
+    // fractional/high DPR an unsnapped edge antialiases against the cell
+    // background, leaving a hairline seam — visible as gaps between rows of
+    // half-block art. Snapping the split to a physical pixel makes adjacent
+    // fills (and the cell background) tile exactly.
+    const dpr = this.devicePixelRatio;
+    const snap = (v: number): number => Math.round(v * dpr) / dpr;
+
+    // Vertical band between two fractions of the cell height (0 = top, 1 = bottom).
+    const vfill = (f0: number, f1: number): void => {
+      const y0 = snap(cellY + height * f0);
+      const y1 = snap(cellY + height * f1);
+      this.ctx.fillRect(cellX, y0, cellWidth, y1 - y0);
+    };
+
+    // Horizontal band between two fractions of the cell width (0 = left, 1 = right).
+    const hfill = (f0: number, f1: number): void => {
+      const x0 = snap(cellX + cellWidth * f0);
+      const x1 = snap(cellX + cellWidth * f1);
+      this.ctx.fillRect(x0, cellY, x1 - x0, height);
+    };
+
+    // Rectangular sub-cell region (fractions of width/height), device-snapped.
+    // Used for the quadrant blocks (U+2596-U+259F).
+    const qfill = (fx0: number, fy0: number, fx1: number, fy1: number): void => {
+      const x0 = snap(cellX + cellWidth * fx0);
+      const x1 = snap(cellX + cellWidth * fx1);
+      const y0 = snap(cellY + height * fy0);
+      const y1 = snap(cellY + height * fy1);
+      this.ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+    };
+
     // Block Elements (U+2580-U+259F)
     switch (codepoint) {
       case 0x2580: // ▀ UPPER HALF BLOCK
-        this.ctx.fillRect(cellX, cellY, cellWidth, height / 2);
+        vfill(0, 1 / 2);
         return true;
       case 0x2581: // ▁ LOWER ONE EIGHTH BLOCK
-        this.ctx.fillRect(cellX, cellY + (height * 7) / 8, cellWidth, height / 8);
+        vfill(7 / 8, 1);
         return true;
       case 0x2582: // ▂ LOWER ONE QUARTER BLOCK
-        this.ctx.fillRect(cellX, cellY + (height * 3) / 4, cellWidth, height / 4);
+        vfill(3 / 4, 1);
         return true;
       case 0x2583: // ▃ LOWER THREE EIGHTHS BLOCK
-        this.ctx.fillRect(cellX, cellY + (height * 5) / 8, cellWidth, (height * 3) / 8);
+        vfill(5 / 8, 1);
         return true;
       case 0x2584: // ▄ LOWER HALF BLOCK
-        this.ctx.fillRect(cellX, cellY + height / 2, cellWidth, height / 2);
+        vfill(1 / 2, 1);
         return true;
       case 0x2585: // ▅ LOWER FIVE EIGHTHS BLOCK
-        this.ctx.fillRect(cellX, cellY + (height * 3) / 8, cellWidth, (height * 5) / 8);
+        vfill(3 / 8, 1);
         return true;
       case 0x2586: // ▆ LOWER THREE QUARTERS BLOCK
-        this.ctx.fillRect(cellX, cellY + height / 4, cellWidth, (height * 3) / 4);
+        vfill(1 / 4, 1);
         return true;
       case 0x2587: // ▇ LOWER SEVEN EIGHTHS BLOCK
-        this.ctx.fillRect(cellX, cellY + height / 8, cellWidth, (height * 7) / 8);
+        vfill(1 / 8, 1);
         return true;
       case 0x2588: // █ FULL BLOCK
         this.ctx.fillRect(cellX, cellY, cellWidth, height);
         return true;
       case 0x2589: // ▉ LEFT SEVEN EIGHTHS BLOCK
-        this.ctx.fillRect(cellX, cellY, (cellWidth * 7) / 8, height);
+        hfill(0, 7 / 8);
         return true;
       case 0x258a: // ▊ LEFT THREE QUARTERS BLOCK
-        this.ctx.fillRect(cellX, cellY, (cellWidth * 3) / 4, height);
+        hfill(0, 3 / 4);
         return true;
       case 0x258b: // ▋ LEFT FIVE EIGHTHS BLOCK
-        this.ctx.fillRect(cellX, cellY, (cellWidth * 5) / 8, height);
+        hfill(0, 5 / 8);
         return true;
       case 0x258c: // ▌ LEFT HALF BLOCK
-        this.ctx.fillRect(cellX, cellY, cellWidth / 2, height);
+        hfill(0, 1 / 2);
         return true;
       case 0x258d: // ▍ LEFT THREE EIGHTHS BLOCK
-        this.ctx.fillRect(cellX, cellY, (cellWidth * 3) / 8, height);
+        hfill(0, 3 / 8);
         return true;
       case 0x258e: // ▎ LEFT ONE QUARTER BLOCK
-        this.ctx.fillRect(cellX, cellY, cellWidth / 4, height);
+        hfill(0, 1 / 4);
         return true;
       case 0x258f: // ▏ LEFT ONE EIGHTH BLOCK
-        this.ctx.fillRect(cellX, cellY, cellWidth / 8, height);
+        hfill(0, 1 / 8);
         return true;
       case 0x2590: // ▐ RIGHT HALF BLOCK
-        this.ctx.fillRect(cellX + cellWidth / 2, cellY, cellWidth / 2, height);
+        hfill(1 / 2, 1);
         return true;
       case 0x2594: // ▔ UPPER ONE EIGHTH BLOCK
-        this.ctx.fillRect(cellX, cellY, cellWidth, height / 8);
+        vfill(0, 1 / 8);
         return true;
       case 0x2595: // ▕ RIGHT ONE EIGHTH BLOCK
-        this.ctx.fillRect(cellX + (cellWidth * 7) / 8, cellY, cellWidth / 8, height);
+        hfill(7 / 8, 1);
+        return true;
+
+      // Quadrant blocks (U+2596-U+259F). Cell split into four equal quarters.
+      case 0x2596: // ▖ QUADRANT LOWER LEFT
+        qfill(0, 1 / 2, 1 / 2, 1);
+        return true;
+      case 0x2597: // ▗ QUADRANT LOWER RIGHT
+        qfill(1 / 2, 1 / 2, 1, 1);
+        return true;
+      case 0x2598: // ▘ QUADRANT UPPER LEFT
+        qfill(0, 0, 1 / 2, 1 / 2);
+        return true;
+      case 0x2599: // ▙ QUADRANT UPPER LEFT AND LOWER LEFT AND LOWER RIGHT
+        qfill(0, 0, 1 / 2, 1 / 2);
+        qfill(0, 1 / 2, 1, 1);
+        return true;
+      case 0x259a: // ▚ QUADRANT UPPER LEFT AND LOWER RIGHT
+        qfill(0, 0, 1 / 2, 1 / 2);
+        qfill(1 / 2, 1 / 2, 1, 1);
+        return true;
+      case 0x259b: // ▛ QUADRANT UPPER LEFT AND UPPER RIGHT AND LOWER LEFT
+        qfill(0, 0, 1, 1 / 2);
+        qfill(0, 1 / 2, 1 / 2, 1);
+        return true;
+      case 0x259c: // ▜ QUADRANT UPPER LEFT AND UPPER RIGHT AND LOWER RIGHT
+        qfill(0, 0, 1, 1 / 2);
+        qfill(1 / 2, 1 / 2, 1, 1);
+        return true;
+      case 0x259d: // ▝ QUADRANT UPPER RIGHT
+        qfill(1 / 2, 0, 1, 1 / 2);
+        return true;
+      case 0x259e: // ▞ QUADRANT UPPER RIGHT AND LOWER LEFT
+        qfill(1 / 2, 0, 1, 1 / 2);
+        qfill(0, 1 / 2, 1 / 2, 1);
+        return true;
+      case 0x259f: // ▟ QUADRANT UPPER RIGHT AND LOWER LEFT AND LOWER RIGHT
+        qfill(1 / 2, 0, 1, 1 / 2);
+        qfill(0, 1 / 2, 1, 1);
         return true;
       default:
         return false;
