@@ -72,6 +72,19 @@ export interface FontMetrics {
 }
 
 // ============================================================================
+// Scrollbar layout
+// ============================================================================
+
+// Width (CSS px) of the gutter reserved on the right edge of the canvas for
+// the scrollback scrollbar. The text grid is laid out across `cols *
+// metrics.width` and the canvas is made this much wider so the scrollbar
+// (drawn by renderScrollbar) sits beside the text instead of on top of it.
+// Must be >= the scrollbar's drawn footprint (8px bar + 4px right pad + 2px
+// left clear = 14px) and should match FitAddon's DEFAULT_SCROLLBAR_WIDTH so
+// the reserved columns line up with the reserved pixels.
+export const SCROLLBAR_GUTTER = 15;
+
+// ============================================================================
 // Default Theme
 // ============================================================================
 
@@ -84,6 +97,11 @@ export const DEFAULT_THEME: Required<ITheme> = {
   // Using Ghostty's approach: selection bg = default fg, selection fg = default bg
   selectionBackground: '#d4d4d4',
   selectionForeground: '#1e1e1e',
+  // Thumb is a subtle neutral grey by default. The track is empty by default
+  // (matches VS Code, whose scrollbars have no visible track): the gutter just
+  // shows the terminal background. Set scrollbarTrack to draw a channel.
+  scrollbarThumb: 'rgba(128, 128, 128, 0.5)',
+  scrollbarTrack: '',
   black: '#000000',
   red: '#cd3131',
   green: '#0dbc79',
@@ -395,7 +413,10 @@ export class CanvasRenderer {
    * Resize canvas to fit terminal dimensions
    */
   public resize(cols: number, rows: number): void {
-    const cssWidth = cols * this.metrics.width;
+    // Text occupies `cols * metrics.width`; the canvas is widened by
+    // SCROLLBAR_GUTTER so the scrollbar has its own space on the right and
+    // never paints over the last columns of text.
+    const cssWidth = cols * this.metrics.width + SCROLLBAR_GUTTER;
     const cssHeight = rows * this.metrics.height;
 
     // Set CSS size (what user sees)
@@ -457,7 +478,8 @@ export class CanvasRenderer {
 
     // Resize canvas if dimensions changed
     const needsResize =
-      this.canvas.width !== dims.cols * this.metrics.width * this.devicePixelRatio ||
+      this.canvas.width !==
+        (dims.cols * this.metrics.width + SCROLLBAR_GUTTER) * this.devicePixelRatio ||
       this.canvas.height !== dims.rows * this.metrics.height * this.devicePixelRatio;
 
     if (needsResize) {
@@ -1824,15 +1846,28 @@ export class CanvasRenderer {
     const scrollPosition = viewportY / scrollbackLength; // 0 to 1
     const thumbY = scrollbarPadding + (scrollbarTrackHeight - thumbHeight) * (1 - scrollPosition);
 
-    // Draw scrollbar track (subtle background) with opacity
-    ctx.fillStyle = `rgba(128, 128, 128, ${0.1 * opacity})`;
-    ctx.fillRect(scrollbarX, scrollbarPadding, scrollbarWidth, scrollbarTrackHeight);
+    // Track and thumb colors come from the theme. The fade-in/out (opacity)
+    // and the idle dim are applied via globalAlpha so they compose over
+    // whatever base color the theme provides, instead of being baked into a
+    // hardcoded rgba string.
+    ctx.save();
 
-    // Draw scrollbar thumb with opacity
-    const isScrolled = viewportY > 0;
-    const baseOpacity = isScrolled ? 0.5 : 0.3;
-    ctx.fillStyle = `rgba(128, 128, 128, ${baseOpacity * opacity})`;
+    // Track: only drawn if the theme provides one. By default it's empty so the
+    // gutter stays the terminal background, like VS Code's own scrollbars.
+    if (this.theme.scrollbarTrack) {
+      ctx.globalAlpha = opacity;
+      ctx.fillStyle = this.theme.scrollbarTrack;
+      ctx.fillRect(scrollbarX, scrollbarPadding, scrollbarWidth, scrollbarTrackHeight);
+    }
+
+    // Thumb: dimmed to 60% when resting at the bottom, full when scrolled.
+    // (Matches the previous 0.3-vs-0.5 alpha split against the 0.5 default.)
+    const idleDim = viewportY > 0 ? 1 : 0.6;
+    ctx.globalAlpha = opacity * idleDim;
+    ctx.fillStyle = this.theme.scrollbarThumb;
     ctx.fillRect(scrollbarX, thumbY, scrollbarWidth, thumbHeight);
+
+    ctx.restore();
   }
   public getMetrics(): FontMetrics {
     return { ...this.metrics };

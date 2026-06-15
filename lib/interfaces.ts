@@ -52,6 +52,12 @@ export interface ITheme {
   selectionBackground?: string;
   selectionForeground?: string;
 
+  // Scrollback scrollbar. Both accept any CSS color (including rgba) so the
+  // alpha can be tuned per theme. The renderer applies the fade-in/out and
+  // idle dimming on top via globalAlpha, so these are the base colors.
+  scrollbarThumb?: string;
+  scrollbarTrack?: string;
+
   // ANSI colors (0-15)
   black?: string;
   red?: string;
