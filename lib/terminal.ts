@@ -26,7 +26,7 @@ import type {
 import { LinkDetector } from './link-detector';
 import { OSC8LinkProvider } from './providers/osc8-link-provider';
 import { UrlRegexProvider } from './providers/url-regex-provider';
-import { CanvasRenderer, DEFAULT_THEME, type IRenderable } from './renderer';
+import { CanvasRenderer, DEFAULT_THEME, type IRenderable, SCROLLBAR_GUTTER } from './renderer';
 import { SelectionManager } from './selection-manager';
 import { TerminalCore } from './terminal-core';
 import type { ILink, ILinkProvider } from './types';
@@ -293,9 +293,10 @@ export class Terminal extends TerminalCore {
     this.renderer.resize(this.cols, this.rows);
 
     const metrics = this.renderer.getMetrics();
-    this.canvas.width = metrics.width * this.cols;
+    // Reserve SCROLLBAR_GUTTER on the right so the scrollbar never overlaps text.
+    this.canvas.width = metrics.width * this.cols + SCROLLBAR_GUTTER;
     this.canvas.height = metrics.height * this.rows;
-    this.canvas.style.width = `${metrics.width * this.cols}px`;
+    this.canvas.style.width = `${metrics.width * this.cols + SCROLLBAR_GUTTER}px`;
     this.canvas.style.height = `${metrics.height * this.rows}px`;
 
     this.updateWasmPixelSize();
@@ -682,9 +683,10 @@ export class Terminal extends TerminalCore {
       if (this.renderer && this.canvas) {
         this.renderer.resize(cols, rows);
         const metrics = this.renderer.getMetrics();
-        this.canvas.width = metrics.width * cols;
+        // Reserve SCROLLBAR_GUTTER on the right so the scrollbar never overlaps text.
+        this.canvas.width = metrics.width * cols + SCROLLBAR_GUTTER;
         this.canvas.height = metrics.height * rows;
-        this.canvas.style.width = `${metrics.width * cols}px`;
+        this.canvas.style.width = `${metrics.width * cols + SCROLLBAR_GUTTER}px`;
         this.canvas.style.height = `${metrics.height * rows}px`;
         this.updateWasmPixelSize();
         this.renderer.render(this.wasmTerm, true, this.viewportY, this);
