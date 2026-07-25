@@ -609,6 +609,22 @@ export class Terminal extends TerminalCore {
         const newViewportY = Math.max(0, Math.min(savedViewportY + delta, newScrollback));
         if (newViewportY !== savedViewportY) {
           this.viewportY = newViewportY;
+
+          // A scroll animation in flight is aiming at a line of content, not
+          // at a number. Growing the scrollback moves that line, so the target
+          // has to move with it. Without this the next animation frame
+          // measures its distance from a target that is now one batch of
+          // output stale and pulls the viewport back toward where the content
+          // used to be — a backwards jump of a line or two, repeating for as
+          // long as output keeps arriving while the user scrolls.
+          if (this.scrollAnimationFrame !== undefined) {
+            const shift = newViewportY - savedViewportY;
+            this.targetViewportY = Math.max(
+              0,
+              Math.min(this.targetViewportY + shift, newScrollback)
+            );
+          }
+
           this.scrollEmitter.fire(this.viewportY);
           if (newScrollback > 0) this.showScrollbar();
         }
@@ -880,6 +896,25 @@ export class Terminal extends TerminalCore {
   // Scrolling (browser override: adds showScrollbar + requestRender)
   // ==========================================================================
 
+  /**
+   * Stop any in-flight smooth scroll and adopt the current position as its
+   * target.
+   *
+   * Anything that moves viewportY directly is expressing an intent that
+   * supersedes whatever the animation was heading for. Left running, the
+   * animation's next frame computes its distance from a target that no longer
+   * means anything and drags the viewport back toward it.
+   */
+  private cancelScrollAnimation(): void {
+    if (this.scrollAnimationFrame !== undefined) {
+      cancelAnimationFrame(this.scrollAnimationFrame);
+      this.scrollAnimationFrame = undefined;
+    }
+    this.scrollAnimationStartTime = undefined;
+    this.scrollAnimationStartY = undefined;
+    this.targetViewportY = this.viewportY;
+  }
+
   override scrollLines(amount: number): void {
     if (!this.wasmTerm) throw new Error('Terminal not open');
 
@@ -888,6 +923,7 @@ export class Terminal extends TerminalCore {
 
     if (newViewportY !== this.viewportY) {
       this.viewportY = newViewportY;
+      this.cancelScrollAnimation();
       this.scrollEmitter.fire(this.viewportY);
 
       if (scrollbackLength > 0) this.showScrollbar();
@@ -903,6 +939,7 @@ export class Terminal extends TerminalCore {
     const scrollbackLength = this.getScrollbackLength();
     if (scrollbackLength > 0 && this.viewportY !== scrollbackLength) {
       this.viewportY = scrollbackLength;
+      this.cancelScrollAnimation();
       this.scrollEmitter.fire(this.viewportY);
       this.showScrollbar();
       this.requestRender();
@@ -912,6 +949,7 @@ export class Terminal extends TerminalCore {
   override scrollToBottom(): void {
     if (this.viewportY !== 0) {
       this.viewportY = 0;
+      this.cancelScrollAnimation();
       this.scrollEmitter.fire(this.viewportY);
       if (this.getScrollbackLength() > 0) this.showScrollbar();
       this.requestRender();
@@ -924,6 +962,7 @@ export class Terminal extends TerminalCore {
 
     if (newViewportY !== this.viewportY) {
       this.viewportY = newViewportY;
+      this.cancelScrollAnimation();
       this.scrollEmitter.fire(this.viewportY);
       if (scrollbackLength > 0) this.showScrollbar();
       this.requestRender();

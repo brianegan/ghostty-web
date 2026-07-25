@@ -3130,6 +3130,71 @@ describe('preserveScrollOnWrite option', () => {
     term.dispose();
   });
 
+  test('a scroll animation in flight retargets when scrollback grows', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({
+      cols: 80,
+      rows: 5,
+      scrollback: 50000,
+      preserveScrollOnWrite: true,
+    });
+    term.open(container);
+
+    for (let i = 0; i < 200; i++) term.write(`line ${i}\r\n`);
+
+    // Stand in for a smooth scroll mid-flight. The animation aims at a line of
+    // content, so when the scrollback grows underneath it the target has to
+    // move by the same amount. Without that, the next animation frame measures
+    // its distance from a stale target and drags the viewport backwards — the
+    // jitter you see as a line or two of jumping while reading during output.
+    const t = term as unknown as {
+      targetViewportY: number;
+      scrollAnimationFrame: number | undefined;
+      viewportY: number;
+    };
+    term.scrollLines(-10);
+    t.targetViewportY = term.viewportY + 20;
+    t.scrollAnimationFrame = 1234; // pretend a frame is scheduled
+
+    const savedTarget = t.targetViewportY;
+    const savedViewportY = term.viewportY;
+    const savedScrollback = term.wasmTerm!.getScrollbackLength();
+
+    term.write('extra line\r\n');
+
+    const shift = term.viewportY - savedViewportY;
+    expect(shift).toBeGreaterThan(0);
+    expect(t.targetViewportY).toBe(savedTarget + shift);
+
+    t.scrollAnimationFrame = undefined;
+    term.dispose();
+  });
+
+  test('scrolling directly clears a stale animation target', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({ cols: 80, rows: 5, scrollback: 50000 });
+    term.open(container);
+    for (let i = 0; i < 200; i++) term.write(`line ${i}\r\n`);
+
+    const t = term as unknown as { targetViewportY: number };
+
+    // Any explicit move supersedes whatever the animation was heading for, so
+    // the target must follow rather than pull the viewport back to it.
+    term.scrollLines(-10);
+    expect(t.targetViewportY).toBe(term.viewportY);
+
+    term.scrollToTop();
+    expect(t.targetViewportY).toBe(term.viewportY);
+
+    term.scrollToBottom();
+    expect(t.targetViewportY).toBe(term.viewportY);
+    expect(term.viewportY).toBe(0);
+
+    term.dispose();
+  });
+
   describe('WASM memory safety', () => {
     let container: HTMLElement | null = null;
 
