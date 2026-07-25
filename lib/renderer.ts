@@ -2669,10 +2669,23 @@ export class CanvasRenderer {
       endY: number;
     } | null
   ): void {
-    // Coarse change check — link-detection is rate-limited upstream and
-    // these setters are only called on hover transitions, so identity
-    // comparison is enough to dedupe back-to-back clears.
-    if (this.hoveredLinkRange === range) return;
+    // Compared by value, not identity. The range is in viewport coordinates
+    // derived from viewportY and the scrollback length, so it has to be
+    // recomputed whenever the view moves even though the link itself has not
+    // changed. That makes a fresh object arrive on every resolve, and an
+    // identity check would request a repaint for each one.
+    const current = this.hoveredLinkRange;
+    if (current === range) return;
+    if (
+      current &&
+      range &&
+      current.startX === range.startX &&
+      current.startY === range.startY &&
+      current.endX === range.endX &&
+      current.endY === range.endY
+    ) {
+      return;
+    }
     this.hoveredLinkRange = range;
     this.onRequestRender?.();
   }
