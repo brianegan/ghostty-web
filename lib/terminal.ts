@@ -165,6 +165,12 @@ export class Terminal extends TerminalCore {
   private scrollAnimationFrame?: number;
   private customWheelEventHandler?: (event: WheelEvent) => boolean;
 
+  // Hover hit-testing cache, valid for one rendered frame. See
+  // getHoverScreenLine().
+  private renderCount: number = 0;
+  private hoverLines: (GhosttyCell[] | null)[] | null = null;
+  private hoverLinesGeneration: number = -1;
+
   // Scrollbar interaction state
   private isDraggingScrollbar: boolean = false;
   private scrollbarDragStart: number | null = null;
@@ -1019,6 +1025,7 @@ export class Terminal extends TerminalCore {
     this.syncOutputStartTime = undefined;
 
     this.renderer!.render(this.wasmTerm!, false, this.viewportY, this, this.scrollbarOpacity);
+    this.renderCount++;
     this.renderEmitter.fire({ start: 0, end: this.rows - 1 });
 
     const cursor = this.wasmTerm!.getCursor();
@@ -1317,6 +1324,24 @@ export class Terminal extends TerminalCore {
     }, 16);
   };
 
+  /**
+   * A screen row for hover testing, backed by one bulk viewport fetch.
+   *
+   * The cache lives for a single render frame: renderCount is bumped by the
+   * render loop, so a hover lookup reuses the fetch only while the buffer it
+   * came from is still what is on screen. Without the generation check a
+   * memoised row would go stale the moment output arrived, and the hover would
+   * report a hyperlink id from a line that had already scrolled away.
+   */
+  private getHoverScreenLine(screenRow: number): GhosttyCell[] | null {
+    if (this.hoverLinesGeneration !== this.renderCount) {
+      this.hoverLines = this.wasmTerm!.getViewportLines?.() ?? null;
+      this.hoverLinesGeneration = this.renderCount;
+    }
+    if (this.hoverLines) return this.hoverLines[screenRow] ?? null;
+    return this.wasmTerm!.getLine(screenRow);
+  }
+
   private processMouseMove(e: MouseEvent): void {
     if (!this.canvas || !this.renderer || !this.linkDetector || !this.wasmTerm) return;
 
@@ -1327,20 +1352,21 @@ export class Terminal extends TerminalCore {
     const viewportRow = y;
     let hyperlinkId = 0;
 
+    // Screen rows come from a bulk fetch, memoised for the current pointer
+    // position. getLine() walks the whole viewport to return one row, so doing
+    // it per mousemove cost a full walk just to read one cell's hyperlink id —
+    // during a drag that landed on top of the per-frame walk the renderer was
+    // already doing. Scrollback rows are a direct per-row read and stay
+    // individual.
     let line: GhosttyCell[] | null = null;
     const rawViewportY = this.getViewportY();
     const viewportY = Math.max(0, Math.floor(rawViewportY));
-    if (viewportY > 0) {
+    if (viewportY > 0 && viewportRow < viewportY) {
       const scrollbackLength = this.wasmTerm.getScrollbackLength();
-      if (viewportRow < viewportY) {
-        const scrollbackOffset = scrollbackLength - viewportY + viewportRow;
-        line = this.wasmTerm.getScrollbackLine(scrollbackOffset);
-      } else {
-        const screenRow = viewportRow - viewportY;
-        line = this.wasmTerm.getLine(screenRow);
-      }
+      line = this.wasmTerm.getScrollbackLine(scrollbackLength - viewportY + viewportRow);
     } else {
-      line = this.wasmTerm.getLine(viewportRow);
+      const screenRow = viewportY > 0 ? viewportRow - viewportY : viewportRow;
+      line = this.getHoverScreenLine(screenRow);
     }
 
     if (line && x >= 0 && x < line.length) {
