@@ -3803,3 +3803,86 @@ describe('Write PTY response routing', () => {
     tb.free();
   });
 });
+
+describe('getScrollbackLines', () => {
+  let container: HTMLElement | null = null;
+
+  beforeEach(() => {
+    if (typeof document !== 'undefined') {
+      container = document.createElement('div');
+      document.body.appendChild(container);
+    }
+  });
+
+  afterEach(() => {
+    if (container?.parentNode) {
+      container.parentNode.removeChild(container);
+      container = null;
+    }
+  });
+
+  // The bulk read hoists the scratch allocation and the palette fetch out of
+  // the per-row path, and re-aims one point struct instead of allocating one
+  // per row. Any mistake there shows up as wrong colours, wrong flags, or rows
+  // offset by one — all of which this catches by requiring the bulk result to
+  // equal the one-at-a-time result cell for cell.
+  test('matches reading the same rows one at a time', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({ cols: 40, rows: 5, scrollback: 5000 });
+    term.open(container);
+
+    // Vary colour, palette index and attributes per row so a hoisted palette
+    // or a stale style buffer cannot pass by accident.
+    for (let i = 0; i < 120; i++) {
+      const fg = 30 + (i % 8);
+      const idx = i % 256;
+      term.write(
+        `row ${i} \x1b[${fg}mbasic\x1b[0m \x1b[38;5;${idx}mpal\x1b[0m ` +
+          `\x1b[1;4;38;2;${i % 256};10;200mtrue\x1b[0m\r\n`
+      );
+    }
+
+    const wasm = term.wasmTerm as unknown as {
+      getScrollbackLines(start: number, count: number): unknown[];
+      getScrollbackLine(offset: number): unknown;
+    };
+
+    const start = 10;
+    const count = 30;
+    const bulk = wasm.getScrollbackLines(start, count);
+    expect(bulk.length).toBe(count);
+    for (let i = 0; i < count; i++) {
+      expect(bulk[i]).toEqual(wasm.getScrollbackLine(start + i) as never);
+    }
+
+    term.dispose();
+  });
+
+  test('handles empty and out-of-range runs like the single-row read', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({ cols: 20, rows: 4, scrollback: 500 });
+    term.open(container);
+    for (let i = 0; i < 30; i++) term.write(`line ${i}\r\n`);
+
+    const wasm = term.wasmTerm as unknown as {
+      getScrollbackLines(start: number, count: number): unknown[];
+      getScrollbackLine(offset: number): unknown;
+      getScrollbackLength(): number;
+    };
+
+    expect(wasm.getScrollbackLines(0, 0)).toEqual([]);
+    expect(wasm.getScrollbackLines(0, -5)).toEqual([]);
+
+    // Straddling the end must agree with the single reads, nulls included.
+    const len = wasm.getScrollbackLength();
+    const bulk = wasm.getScrollbackLines(len - 2, 5);
+    expect(bulk.length).toBe(5);
+    for (let i = 0; i < 5; i++) {
+      expect(bulk[i]).toEqual(wasm.getScrollbackLine(len - 2 + i) as never);
+    }
+
+    term.dispose();
+  });
+});

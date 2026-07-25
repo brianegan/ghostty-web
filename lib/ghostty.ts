@@ -1523,6 +1523,19 @@ export class GhosttyTerminal {
   }
 
   /**
+   * Read a contiguous run of scrollback rows in one pass.
+   *
+   * Each getScrollbackLine() call allocates seven WASM scratch buffers and
+   * re-fetches the entire 256-colour palette before reading a single row. A
+   * renderer showing scrollback needs a run of adjacent rows every frame, so
+   * fetching them one at a time paid that setup forty-odd times a frame. This
+   * pays it once. Same trade as getViewportLines() for the screen.
+   */
+  getScrollbackLines(startOffset: number, count: number): (GhosttyCell[] | null)[] {
+    return this.readGridLines(PointTag.HISTORY, startOffset, count);
+  }
+
+  /**
    * Get the hyperlink URI for a cell at the given position in the active
    * viewport. Returns null when no hyperlink is attached.
    */
@@ -1556,39 +1569,112 @@ export class GhosttyTerminal {
   // free.
   // ==========================================================================
 
-  private readGridLine(tag: PointTag, y: number): GhosttyCell[] | null {
-    const pointPtr = this.allocPoint(tag, 0, y);
+  /**
+   * Scratch buffers plus the resolved palette, shared across a run of grid
+   * reads.
+   *
+   * readGridLine() used to allocate all of this, fetch the whole 256-colour
+   * palette, and free it again on every call. Painting scrollback did that
+   * once per visible row — around forty times a frame — so the setup
+   * dominated the cell reads it existed to serve.
+   *
+   * A grid ref is invalidated by any terminal mutation, so a run has to stay
+   * within one synchronous stretch with no writes in the middle. Every caller
+   * already satisfies that.
+   */
+  private acquireGridScratch(): {
+    pointPtr: number;
+    refPtr: number;
+    palettePtr: number;
+    palette: Uint8Array | null;
+    cellPtr: number;
+    u32Ptr: number;
+    widePtr: number;
+    stylePtr: number;
+  } {
+    const PAL_SIZE = 768;
+    const STYLE_SIZE = 72;
+    const pointPtr = this.allocPoint(PointTag.ACTIVE, 0, 0);
     const refPtr = this.exports.ghostty_wasm_alloc_u8_array(12);
-    new DataView(this.memory.buffer).setUint32(refPtr, 12, true); // size field
-    try {
-      if (this.exports.ghostty_terminal_grid_ref(this.handle, pointPtr, refPtr) !== 0) {
-        return null;
-      }
+    const palettePtr = this.exports.ghostty_wasm_alloc_u8_array(PAL_SIZE);
+    const palOk =
+      this.exports.ghostty_terminal_get(this.handle, TerminalData.COLOR_PALETTE, palettePtr) === 0;
+    const palette = palOk
+      ? new Uint8Array(this.memory.buffer, palettePtr, PAL_SIZE).slice()
+      : null;
+    return {
+      pointPtr,
+      refPtr,
+      palettePtr,
+      palette,
+      cellPtr: this.exports.ghostty_wasm_alloc_u8_array(8),
+      u32Ptr: this.exports.ghostty_wasm_alloc_u8_array(4),
+      widePtr: this.exports.ghostty_wasm_alloc_u8_array(4),
+      stylePtr: this.exports.ghostty_wasm_alloc_u8_array(STYLE_SIZE),
+    };
+  }
 
-      // Pre-fetch the terminal's effective palette (256 RGB triples =
-      // 768 bytes) so we can resolve PALETTE-tagged style colors per
-      // cell without a round-trip per resolution. Cells with style
-      // colors of tag NONE leave fg_r/g/b at 0; the renderer's
-      // isDefaultFg path treats that as "use theme default."
-      const PAL_SIZE = 768;
-      const palettePtr = this.exports.ghostty_wasm_alloc_u8_array(PAL_SIZE);
-      const palOk =
-        this.exports.ghostty_terminal_get(this.handle, TerminalData.COLOR_PALETTE, palettePtr) ===
-        0;
-      const palette = palOk
-        ? new Uint8Array(this.memory.buffer, palettePtr, PAL_SIZE).slice()
-        : null;
+  private releaseGridScratch(s: ReturnType<GhosttyTerminal['acquireGridScratch']>): void {
+    this.exports.ghostty_wasm_free_u8_array(s.stylePtr, 72);
+    this.exports.ghostty_wasm_free_u8_array(s.widePtr, 4);
+    this.exports.ghostty_wasm_free_u8_array(s.u32Ptr, 4);
+    this.exports.ghostty_wasm_free_u8_array(s.cellPtr, 8);
+    this.exports.ghostty_wasm_free_u8_array(s.palettePtr, 768);
+    this.exports.ghostty_wasm_free_u8_array(s.refPtr, 12);
+    this.exports.ghostty_wasm_free_u8_array(s.pointPtr, 24);
+  }
+
+  private readGridLine(tag: PointTag, y: number): GhosttyCell[] | null {
+    const scratch = this.acquireGridScratch();
+    try {
+      return this.readGridLineWith(scratch, tag, y);
+    } finally {
+      this.releaseGridScratch(scratch);
+    }
+  }
+
+  /**
+   * Read a contiguous run of rows, paying the scratch setup once.
+   */
+  private readGridLines(tag: PointTag, startY: number, count: number): (GhosttyCell[] | null)[] {
+    const out = new Array<GhosttyCell[] | null>(Math.max(0, count));
+    if (count <= 0) return out;
+    const scratch = this.acquireGridScratch();
+    try {
+      for (let i = 0; i < count; i++) {
+        out[i] = this.readGridLineWith(scratch, tag, startY + i);
+      }
+    } finally {
+      this.releaseGridScratch(scratch);
+    }
+    return out;
+  }
+
+  private readGridLineWith(
+    s: ReturnType<GhosttyTerminal['acquireGridScratch']>,
+    tag: PointTag,
+    y: number
+  ): GhosttyCell[] | null {
+    const STYLE_SIZE = 72;
+    const { refPtr, cellPtr, u32Ptr, widePtr, stylePtr, palette } = s;
+
+    // Re-aim the point at this row rather than reallocating one per row.
+    new Uint8Array(this.memory.buffer, s.pointPtr, 24).fill(0);
+    {
+      const view = new DataView(this.memory.buffer);
+      view.setUint32(s.pointPtr + 0, tag, true);
+      view.setUint16(s.pointPtr + 8, 0, true);
+      view.setUint32(s.pointPtr + 12, y, true);
+      view.setUint32(refPtr, 12, true); // size field
+    }
+
+    if (this.exports.ghostty_terminal_grid_ref(this.handle, s.pointPtr, refPtr) !== 0) {
+      return null;
+    }
 
       const cells: GhosttyCell[] = new Array(this._cols);
-      const cellPtr = this.exports.ghostty_wasm_alloc_u8_array(8);
-      const u32Ptr = this.exports.ghostty_wasm_alloc_u8_array(4);
-      const widePtr = this.exports.ghostty_wasm_alloc_u8_array(4);
-      // Style is the 72-byte GhosttyStyle sized struct. Initialize the
-      // size discriminator once; the populator overwrites the rest.
-      const STYLE_SIZE = 72;
-      const stylePtr = this.exports.ghostty_wasm_alloc_u8_array(STYLE_SIZE);
       new DataView(this.memory.buffer).setUint32(stylePtr, STYLE_SIZE, true);
-      try {
+      {
         for (let col = 0; col < this._cols; col++) {
           // Step along the row by mutating ref.x in place.
           new DataView(this.memory.buffer).setUint16(refPtr + 8, col, true);
@@ -1655,19 +1741,10 @@ export class GhosttyTerminal {
 
           cells[col] = cell;
         }
-      } finally {
-        this.exports.ghostty_wasm_free_u8_array(cellPtr, 8);
-        this.exports.ghostty_wasm_free_u8_array(u32Ptr, 4);
-        this.exports.ghostty_wasm_free_u8_array(widePtr, 4);
-        this.exports.ghostty_wasm_free_u8_array(stylePtr, STYLE_SIZE);
-        this.exports.ghostty_wasm_free_u8_array(palettePtr, PAL_SIZE);
       }
       return cells;
-    } finally {
-      this.exports.ghostty_wasm_free_u8_array(pointPtr, 24);
-      this.exports.ghostty_wasm_free_u8_array(refPtr, 12);
-    }
   }
+
 
   /**
    * Decode a GhosttyStyleColor (16 bytes at colorPtr — tag@0:u32,
