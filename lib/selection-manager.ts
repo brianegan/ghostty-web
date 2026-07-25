@@ -137,6 +137,15 @@ export class SelectionManager {
     const scrollbackLength = this.wasmTerm.getScrollbackLength();
     let text = '';
 
+    // Screen rows come from a single bulk fetch. getLine() walks the whole
+    // viewport per call, so a selection covering the screen used to pay one
+    // walk per row — measured at ~27ms per call, which landed as a hitch on
+    // every mouseup and every double or triple click. Scrollback rows are a
+    // direct per-row read and stay individual. Fetched lazily so a selection
+    // entirely inside scrollback does no viewport work at all.
+    let screenLines: (GhosttyCell[] | null)[] | null = null;
+    const getViewportLines = (this.wasmTerm as any).getViewportLines;
+
     for (let absRow = startAbsRow; absRow <= endAbsRow; absRow++) {
       // Fetch line based on absolute row position
       // Absolute row < scrollbackLength means it's in scrollback
@@ -149,7 +158,12 @@ export class SelectionManager {
       } else {
         // Row is in screen buffer
         const screenRow = absRow - scrollbackLength;
-        line = this.wasmTerm.getLine(screenRow);
+        if (typeof getViewportLines === 'function') {
+          screenLines ??= getViewportLines.call(this.wasmTerm);
+          line = screenLines?.[screenRow] ?? null;
+        } else {
+          line = this.wasmTerm.getLine(screenRow);
+        }
       }
 
       if (!line) continue;
@@ -484,12 +498,9 @@ export class SelectionManager {
           this.dragThresholdMet = true;
         }
 
-        // Mark current selection rows as dirty before updating
-        this.markCurrentSelectionDirty();
-
         const cell = this.pixelToCell(e.offsetX, e.offsetY);
         const absoluteRow = this.viewportRowToAbsolute(cell.row);
-        this.selectionEnd = { col: cell.col, absoluteRow };
+        this.setSelectionEndDirtyingDelta(cell.col, absoluteRow);
         this.requestRender();
 
         // Check if near edges for auto-scroll
@@ -560,12 +571,9 @@ export class SelectionManager {
           // Only update selection position if NOT auto-scrolling
           // During auto-scroll, the scroll handler extends the selection
           if (this.autoScrollDirection === 0) {
-            // Mark current selection rows as dirty before updating
-            this.markCurrentSelectionDirty();
-
             const cell = this.pixelToCell(offsetX, offsetY);
             const absoluteRow = this.viewportRowToAbsolute(cell.row);
-            this.selectionEnd = { col: cell.col, absoluteRow };
+            this.setSelectionEndDirtyingDelta(cell.col, absoluteRow);
             this.requestRender();
           }
         }
@@ -781,6 +789,52 @@ export class SelectionManager {
         this.dirtySelectionRows.add(row);
       }
     }
+  }
+
+  /**
+   * Move the selection end and dirty only the rows whose appearance changed.
+   *
+   * Marking the whole selection on every mousemove made a drag cost one
+   * repaint per selected row per move — a 40-row selection repainted 40 rows
+   * at pointer rate, which is most of what made dragging feel heavy. Rows in
+   * the middle of a growing selection look identical before and after, so the
+   * work that matters is the symmetric difference of the two ranges plus the
+   * four endpoint rows, whose column extent moves even when they stay
+   * selected. That is normally two rows.
+   *
+   * Both ranges are viewport coordinates clamped to the visible rows, so the
+   * scan is bounded by terminal height regardless of how much scrollback the
+   * selection spans.
+   */
+  private setSelectionEndDirtyingDelta(col: number, absoluteRow: number): void {
+    const before = this.normalizeSelection();
+    this.selectionEnd = { col, absoluteRow };
+    const after = this.normalizeSelection();
+
+    if (!before || !after) {
+      // One side is entirely off-screen; fall back to marking whichever range
+      // is visible rather than reasoning about a partial overlap.
+      for (const range of [before, after]) {
+        if (!range) continue;
+        for (let row = range.startRow; row <= range.endRow; row++) {
+          this.dirtySelectionRows.add(row);
+        }
+      }
+      return;
+    }
+
+    const lo = Math.min(before.startRow, after.startRow);
+    const hi = Math.max(before.endRow, after.endRow);
+    for (let row = lo; row <= hi; row++) {
+      const wasSelected = row >= before.startRow && row <= before.endRow;
+      const isSelected = row >= after.startRow && row <= after.endRow;
+      if (wasSelected !== isSelected) this.dirtySelectionRows.add(row);
+    }
+
+    this.dirtySelectionRows.add(before.startRow);
+    this.dirtySelectionRows.add(before.endRow);
+    this.dirtySelectionRows.add(after.startRow);
+    this.dirtySelectionRows.add(after.endRow);
   }
 
   /**
@@ -1071,11 +1125,17 @@ export class SelectionManager {
   /**
    * Request a render update (triggers selection overlay redraw)
    */
+  /**
+   * Ask for a repaint after changing the selection.
+   *
+   * This used to be empty, on the assumption that a render loop was already
+   * running at 60fps and would pick the change up. There is no such loop:
+   * Terminal schedules a frame only when something asks for one. With no
+   * output arriving — which is the normal case while dragging to select — the
+   * only thing asking was the 530ms cursor blink, so the highlight tracked the
+   * pointer at about two frames a second and the drag felt broken.
+   */
   private requestRender(): void {
-    // The render loop will automatically pick up the new selection state
-    // and redraw the affected lines. This happens at 60fps.
-    //
-    // Note: When clearSelection() is called, it adds dirty rows to dirtySelectionRows
-    // which the renderer can use to know which lines to redraw.
+    this.renderer.requestRender();
   }
 }
