@@ -59,6 +59,12 @@ export interface IRenderable {
 
 export interface IScrollbackProvider {
   getScrollbackLine(offset: number): GhosttyCell[] | null;
+  /**
+   * Bulk read of a contiguous run. Strongly preferred when present: each
+   * single-row read re-allocates WASM scratch and re-fetches the palette, and
+   * a frame showing scrollback needs a run of adjacent rows.
+   */
+  getScrollbackLines?(startOffset: number, count: number): (GhosttyCell[] | null)[];
   getScrollbackLength(): number;
 }
 
@@ -975,7 +981,13 @@ export class CanvasRenderer {
     // Scrollback rows are already a direct per-row grid walk, so they stay
     // individual.
     let screenLines: (GhosttyCell[] | null)[] | null = null;
+    let historyLines: (GhosttyCell[] | null)[] | null = null;
     const lineCache = new Array<GhosttyCell[] | null | undefined>(dims.rows);
+
+    // The scrollback rows on screen are always the contiguous run starting
+    // here, so they can be read in one pass rather than one call per row.
+    const firstHistoryOffset = scrollbackLength - flooredViewportY;
+    const historyCount = Math.min(flooredViewportY, dims.rows);
 
     const lineAt = (y: number): GhosttyCell[] | null => {
       const cached = lineCache[y];
@@ -983,8 +995,18 @@ export class CanvasRenderer {
 
       let line: GhosttyCell[] | null = null;
       if (flooredViewportY > 0 && y < flooredViewportY && scrollbackProvider) {
-        // Upper part of the viewport is served from scrollback.
-        line = scrollbackProvider.getScrollbackLine(scrollbackLength - flooredViewportY + y);
+        // Upper part of the viewport is served from scrollback. Each
+        // single-row read re-allocates WASM scratch and re-fetches the whole
+        // palette, which at forty rows a frame cost more than painting them.
+        if (scrollbackProvider.getScrollbackLines) {
+          historyLines ??= scrollbackProvider.getScrollbackLines(
+            firstHistoryOffset,
+            historyCount
+          );
+          line = historyLines[y] ?? null;
+        } else {
+          line = scrollbackProvider.getScrollbackLine(firstHistoryOffset + y);
+        }
       } else {
         // Lower part (or the whole viewport when at the bottom) is the screen.
         const screenRow = flooredViewportY > 0 ? y - flooredViewportY : y;

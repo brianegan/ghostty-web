@@ -297,6 +297,11 @@ export class TerminalCore implements IDisposable {
     return this.wasmTerm.getScrollbackLine(offset);
   }
 
+  public getScrollbackLines(startOffset: number, count: number): (GhosttyCell[] | null)[] {
+    if (!this.wasmTerm) return new Array(Math.max(0, count)).fill(null);
+    return this.wasmTerm.getScrollbackLines(startOffset, count);
+  }
+
   getMode(mode: number, isAnsi: boolean = false): boolean {
     if (!this.wasmTerm) return false;
     return this.wasmTerm.getMode(mode, isAnsi);
