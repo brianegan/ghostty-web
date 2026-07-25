@@ -1563,6 +1563,40 @@ export class GhosttyTerminal {
   }
 
   /**
+   * Whether a scrollback row is a continuation of the row above it.
+   *
+   * buffer.ts reported false for every scrollback row with a TODO saying the
+   * WASM API was missing. It is not: a grid ref resolves to a row handle, and
+   * the row carries wrap_continuation. Without this a URL that soft-wraps stops
+   * being detected as one link the moment it scrolls out of the live screen,
+   * because the link providers use this flag to find where a logical line
+   * starts.
+   */
+  isScrollbackRowWrapped(offset: number): boolean {
+    const pointPtr = this.allocPoint(PointTag.HISTORY, 0, offset);
+    const refPtr = this.exports.ghostty_wasm_alloc_u8_array(12);
+    const rowPtr = this.exports.ghostty_wasm_alloc_u8_array(8);
+    const outPtr = this.exports.ghostty_wasm_alloc_u8_array(1);
+    try {
+      new DataView(this.memory.buffer).setUint32(refPtr, 12, true); // size field
+      if (this.exports.ghostty_terminal_grid_ref(this.handle, pointPtr, refPtr) !== 0) {
+        return false;
+      }
+      if (this.exports.ghostty_grid_ref_row(refPtr, rowPtr) !== 0) return false;
+      const rowU64 = new DataView(this.memory.buffer).getBigUint64(rowPtr, true);
+      if (this.exports.ghostty_row_get(rowU64, RowData.WRAP_CONTINUATION, outPtr) !== 0) {
+        return false;
+      }
+      return new DataView(this.memory.buffer).getUint8(outPtr) !== 0;
+    } finally {
+      this.exports.ghostty_wasm_free_u8_array(outPtr, 1);
+      this.exports.ghostty_wasm_free_u8_array(rowPtr, 8);
+      this.exports.ghostty_wasm_free_u8_array(refPtr, 12);
+      this.exports.ghostty_wasm_free_u8_array(pointPtr, 24);
+    }
+  }
+
+  /**
    * Read a contiguous run of scrollback rows in one pass.
    *
    * Each getScrollbackLine() call allocates seven WASM scratch buffers and

@@ -4066,3 +4066,86 @@ describe('hover refresh when content moves', () => {
     term.dispose();
   });
 });
+
+describe('hovered link highlight tracks the content', () => {
+  let container: HTMLElement | null = null;
+
+  beforeEach(() => {
+    if (typeof document !== 'undefined') {
+      container = document.createElement('div');
+      document.body.appendChild(container);
+    }
+  });
+
+  afterEach(() => {
+    if (container?.parentNode) {
+      container.parentNode.removeChild(container);
+      container = null;
+    }
+  });
+
+  // The highlight is stored in viewport coordinates derived from viewportY and
+  // the scrollback length. It used to be recomputed only when the hovered link
+  // itself changed, so scrolling or new output left it pinned to a screen row
+  // while the text moved out from under it. On a wrapped link that showed up as
+  // one of its two rows staying lit after the link had moved on.
+  test('the underline follows a wrapped link when the view scrolls', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({ cols: 80, rows: 6, scrollback: 200 });
+    term.open(container);
+
+    const url = `http://example.com/${'a'.repeat(90)}`; // 109 chars, wraps at 80
+
+    // Four filler rows, the link on absolute rows 4 and 5, then enough after it
+    // to push everything into scrollback.
+    for (let i = 0; i < 4; i++) term.write(`filler ${i}\r\n`);
+    term.write(`${url}\r\n`);
+    for (let i = 0; i < 8; i++) term.write(`tail ${i}\r\n`);
+
+    const t = term as unknown as {
+      renderer: {
+        charHeight: number;
+        hoveredLinkRange: { startX: number; startY: number; endX: number; endY: number } | null;
+      };
+      currentHoveredLink?: { text: string };
+      processMouseMove(e: MouseEvent): void;
+      renderTick(): void;
+    };
+
+    // Scroll back so the link is on screen with a row to spare below it, then
+    // find which row it landed on rather than deriving it. Point at its *last*
+    // row: scrolling up moves content down, so one more line of scroll leaves
+    // this same spot on the link rather than on its neighbour.
+    term.scrollLines(-6);
+
+    const rowCentre = (row: number) => row * t.renderer.charHeight + t.renderer.charHeight / 2;
+    let before: { startX: number; startY: number; endX: number; endY: number } | null = null;
+    for (let row = 0; row < 5; row++) {
+      t.processMouseMove({ clientX: 20, clientY: rowCentre(row) } as MouseEvent);
+      await new Promise((r) => setTimeout(r, 20));
+      const range = t.renderer.hoveredLinkRange;
+      if (t.currentHoveredLink?.text === url && range && range.endY === row) {
+        before = { ...range };
+        break;
+      }
+    }
+
+    expect(before).not.toBeNull();
+    expect(before!.endY).toBe(before!.startY + 1); // spans two rows
+
+    // Scroll without writing. No write means the link cache is not invalidated,
+    // so the same link object comes back and only the viewport coordinates
+    // should differ. That is the case the old code got wrong.
+    term.scrollLines(-1);
+    t.renderTick();
+    await new Promise((r) => setTimeout(r, 30));
+
+    const after = t.renderer.hoveredLinkRange;
+    expect(after).not.toBeNull();
+    expect(after!.startY).toBe(before!.startY + 1);
+    expect(after!.endY).toBe(before!.endY + 1);
+
+    term.dispose();
+  });
+});

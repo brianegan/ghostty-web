@@ -1456,7 +1456,16 @@ export class Terminal extends TerminalCore {
           const cursorStyle = link ? 'pointer' : 'text';
           if (this.element) this.element.style.cursor = cursorStyle;
           if (this.canvas) this.canvas.style.cursor = cursorStyle;
+        }
 
+        // Outside the identity check above on purpose. The highlight is stored
+        // in viewport coordinates worked out from viewportY and the scrollback
+        // length, and both of those move while the pointer stays on the same
+        // link. Recomputing only when the link changed left the underline
+        // pinned to a screen row while the text scrolled out from under it,
+        // which was most obvious on a wrapped link where one of its two rows
+        // stayed lit after the link had moved on.
+        {
           if (this.renderer) {
             if (link) {
               const scrollbackLength = this.wasmTerm?.getScrollbackLength() || 0;
