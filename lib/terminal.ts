@@ -426,6 +426,13 @@ export class Terminal extends TerminalCore {
         if (this.wasmTerm?.hasFocusEvents()) this.dataEmitter.fire('\x1b[O');
       });
 
+      // Losing the window is the pointer leaving as far as hover is concerned.
+      // Opening a link switches to the browser without firing mouseleave, so
+      // the hover stayed set, and refreshHoverForMovedContent would go on
+      // re-resolving it from a pointer position that is no longer over
+      // anything. Same teardown as the pointer actually leaving.
+      window.addEventListener('blur', this.handleMouseLeave);
+
       this.renderer = new CanvasRenderer(this.canvas, {
         fontSize: this.options.fontSize,
         fontFamily: this.options.fontFamily,
@@ -1166,6 +1173,7 @@ export class Terminal extends TerminalCore {
       this.element.removeEventListener('mousedown', this.handleMouseDown, { capture: true });
       this.element.removeEventListener('mousemove', this.handleMouseMove);
       this.element.removeEventListener('mouseleave', this.handleMouseLeave);
+      window.removeEventListener('blur', this.handleMouseLeave);
       this.element.removeEventListener('click', this.handleClick);
 
       this.element.removeAttribute('role');

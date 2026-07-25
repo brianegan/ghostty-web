@@ -4149,3 +4149,70 @@ describe('hovered link highlight tracks the content', () => {
     term.dispose();
   });
 });
+
+describe('hover clears when the window loses focus', () => {
+  let container: HTMLElement | null = null;
+
+  beforeEach(() => {
+    if (typeof document !== 'undefined') {
+      container = document.createElement('div');
+      document.body.appendChild(container);
+    }
+  });
+
+  afterEach(() => {
+    if (container?.parentNode) {
+      container.parentNode.removeChild(container);
+      container = null;
+    }
+  });
+
+  // Opening a link switches to the browser without firing mouseleave, so the
+  // hover stayed set with the pointer no longer over anything, and
+  // refreshHoverForMovedContent would keep re-resolving it from that position.
+  test('blur tears down the hover and stops it being re-resolved', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({ cols: 80, rows: 6, scrollback: 200 });
+    term.open(container);
+
+    const url = `http://example.com/${'a'.repeat(90)}`;
+    for (let i = 0; i < 4; i++) term.write(`filler ${i}\r\n`);
+    term.write(`${url}\r\n`);
+    for (let i = 0; i < 8; i++) term.write(`tail ${i}\r\n`);
+
+    const t = term as unknown as {
+      renderer: { charHeight: number; hoveredLinkRange: unknown };
+      currentHoveredLink?: { text: string };
+      lastPointer?: { clientX: number; clientY: number };
+      processMouseMove(e: MouseEvent): void;
+      renderTick(): void;
+    };
+
+    term.scrollLines(-6);
+    let hovered = false;
+    for (let row = 0; row < 5 && !hovered; row++) {
+      t.processMouseMove({ clientX: 20, clientY: row * t.renderer.charHeight + 7 } as MouseEvent);
+      await new Promise((r) => setTimeout(r, 20));
+      hovered = t.currentHoveredLink?.text === url;
+    }
+    expect(hovered).toBe(true);
+    expect(t.renderer.hoveredLinkRange).not.toBeNull();
+
+    // Switching away from the app.
+    window.dispatchEvent(new Event('blur'));
+
+    expect(t.currentHoveredLink).toBeUndefined();
+    expect(t.renderer.hoveredLinkRange).toBeNull();
+    expect(t.lastPointer).toBeUndefined();
+
+    // And it must not come back on its own while the window is still away.
+    term.scrollLines(-1);
+    t.renderTick();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(t.currentHoveredLink).toBeUndefined();
+    expect(t.renderer.hoveredLinkRange).toBeNull();
+
+    term.dispose();
+  });
+});
