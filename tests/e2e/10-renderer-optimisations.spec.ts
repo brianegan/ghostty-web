@@ -241,3 +241,160 @@ test('glyph atlas and scroll blit match the unoptimised paths', async ({ page })
   expect(result.rowsPainted.plain).toBe(result.frames * result.rows);
   expect(result.rowsPainted.both).toBeLessThan(result.rowsPainted.plain / 4);
 });
+
+// The blit used to be disabled outright whenever anything was selected, because
+// it moves pixels with the highlight already painted into them and the row hash
+// only covered cell content — a row whose highlight changed would hash
+// identical and be retained with a stale selection. That meant every frame of a
+// drag repainted the entire viewport, which is the common case: dragging a
+// selection while the viewport auto-scrolls.
+//
+// The row hash now includes the row's selected column span, so a changed
+// highlight fails verification like any other change. This guards that: the
+// selection moves every frame while the viewport scrolls, and the blitted
+// output must be pixel-identical to a full repaint.
+test('scroll blit is exact while a selection is being dragged', async ({ page }) => {
+  page.on('pageerror', (e) => console.error('PAGE ERROR:', e.message));
+  await page.goto('/demo/', { waitUntil: 'networkidle' });
+
+  const result = await page.evaluate(async () => {
+    const { CanvasRenderer } = await import('/lib/renderer.ts');
+
+    const COLS = 40;
+    const ROWS = 16;
+    const FRAMES = 24;
+    const TOTAL = 200;
+
+    const mk = (ch: string) => ({
+      codepoint: ch.codePointAt(0) ?? 32,
+      fg_r: 212, fg_g: 212, fg_b: 212,
+      bg_r: 30, bg_g: 30, bg_b: 30,
+      fgIsDefault: true, bgIsDefault: true,
+      flags: 0, width: 1, hyperlink_id: 0, grapheme_len: 0,
+    });
+    type Cell = ReturnType<typeof mk>;
+
+    const corpus: Cell[][] = [];
+    for (let n = 0; n < TOTAL; n++) {
+      const label = `row ${n} `.padEnd(COLS, 'abcdefgh');
+      corpus.push([...label.slice(0, COLS)].map(mk));
+    }
+
+    const makeView = (first: number) => {
+      const screen: Cell[][] = [];
+      for (let y = 0; y < ROWS; y++) screen.push(corpus[first + y] ?? []);
+      return {
+        buffer: {
+          getLine: (y: number) => screen[y] ?? null,
+          getViewportLines: () => screen.slice(),
+          getCursor: () => ({ x: 0, y: 0, visible: false }),
+          getDimensions: () => ({ cols: COLS, rows: ROWS }),
+          isRowDirty: () => true,
+          needsFullRedraw: () => false,
+          clearDirty: () => {},
+          getGraphemeString: (y: number, x: number) =>
+            String.fromCodePoint(screen[y]?.[x]?.codepoint || 32),
+        },
+        scrollback: {
+          getScrollbackLength: () => first,
+          getScrollbackLine: (offset: number) => corpus[offset] ?? null,
+        },
+      };
+    };
+
+    // A selection whose end walks down and right, as a drag would.
+    const selAt = (f: number) => ({
+      startCol: 3,
+      startRow: 2,
+      endCol: 5 + (f % (COLS - 6)),
+      endRow: 4 + (f % (ROWS - 5)),
+    });
+
+    let rowClears = 0;
+    let countHeight = 0;
+    const origClearRect = CanvasRenderingContext2D.prototype.clearRect;
+    CanvasRenderingContext2D.prototype.clearRect = function (
+      x: number, y: number, w: number, h: number
+    ) {
+      if (countHeight > 0 && x === 0 && Math.abs(h - countHeight) < 0.001) rowClears++;
+      return origClearRect.call(this, x, y, w, h);
+    };
+
+    const run = (scrollBlit: boolean) => {
+      const canvas = document.createElement('canvas');
+      document.body.appendChild(canvas);
+      const r = new CanvasRenderer(canvas, {
+        fontSize: 15, fontFamily: 'monospace', devicePixelRatio: 2,
+        glyphAtlas: true, scrollBlit,
+      });
+      r.resize(COLS, ROWS);
+
+      let coords = selAt(0);
+      r.setSelectionManager({
+        hasSelection: () => true,
+        getSelectionCoords: () => coords,
+        getDirtySelectionRows: () => new Set<number>(),
+        clearDirtySelectionRows: () => {},
+      } as never);
+
+      // Parked 8 rows up inside a real scrollback, so the top of the viewport
+      // is served from scrollback and the bottom from the screen — the split
+      // the blit has to get right. Starting at 100 guarantees the scrollback
+      // is deep enough that those rows resolve to real lines.
+      const v0 = makeView(100);
+      r.render(v0.buffer as never, true, 8, v0.scrollback as never, 0);
+
+      countHeight = r.getMetrics().height;
+      rowClears = 0;
+      for (let f = 1; f <= FRAMES; f++) {
+        coords = selAt(f);
+        // Scrollback grows by one line a frame while the viewport stays 8 rows
+        // up, which is a one-row shift per frame: an auto-scrolling drag.
+        const v = makeView(100 + f);
+        r.render(v.buffer as never, false, 8, v.scrollback as never, 0);
+      }
+      const painted = rowClears;
+      countHeight = 0;
+
+      const ctx = canvas.getContext('2d')!;
+      const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      return { data: Array.from(img.data), w: canvas.width, h: canvas.height, painted };
+    };
+
+    const off = run(false);
+    const on = run(true);
+
+    let diff = 0;
+    let maxDelta = 0;
+    for (let i = 0; i < off.data.length; i += 4) {
+      let d = 0;
+      for (let c = 0; c < 4; c++) d = Math.max(d, Math.abs(off.data[i + c] - on.data[i + c]));
+      if (d > 0) diff++;
+      if (d > maxDelta) maxDelta = d;
+    }
+
+    return {
+      sizeMismatch: off.w !== on.w || off.h !== on.h,
+      diff, maxDelta, total: off.data.length / 4,
+      painted: { off: off.painted, on: on.painted },
+      frames: FRAMES, rows: ROWS,
+    };
+  });
+
+  console.log(JSON.stringify(result, null, 2));
+
+  // Any stale highlight left behind by a retained row shows up here.
+  expect(result.sizeMismatch).toBe(false);
+  expect(result.maxDelta).toBe(0);
+  expect(result.diff).toBe(0);
+
+  // Without the blit this is a guaranteed full repaint every frame, which is
+  // the thing being fixed.
+  expect(result.painted.off).toBe(result.frames * result.rows);
+
+  // The saving is modest here by construction: the selection end moves every
+  // single frame and periodically snaps back, so a large share of rows really
+  // do change their highlight and have to be repainted. A gentler drag saves
+  // far more. What matters is that a full repaint is no longer guaranteed.
+  expect(result.painted.on).toBeLessThan(result.painted.off * 0.8);
+});

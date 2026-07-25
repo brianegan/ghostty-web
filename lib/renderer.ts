@@ -361,6 +361,14 @@ export class CanvasRenderer {
     endCol: number;
     endRow: number;
   } | null = null;
+  // Same coordinates as of the previous rendered frame, so a frame can repaint
+  // just the rows whose selection appearance changed.
+  private previousSelectionCoords: {
+    startCol: number;
+    startRow: number;
+    endCol: number;
+    endRow: number;
+  } | null = null;
 
   // Link rendering state
   private hoveredHyperlinkId: number = 0;
@@ -712,6 +720,25 @@ export class CanvasRenderer {
       }
     }
 
+    // Fold in which columns of this row are selected.
+    //
+    // The blit moves pixels that already have the selection highlight painted
+    // into them, so a row whose highlighted span changed must not be retained
+    // even when its text is byte-identical. Hashing the span is what makes it
+    // safe for the blit to run while a selection exists at all — without it
+    // the only safe option was to disable the blit whenever anything was
+    // selected, which meant every frame of a drag repainted the whole
+    // viewport.
+    const sel = this.currentSelectionCoords;
+    let selStart = -1;
+    let selEnd = -1;
+    if (sel && y >= sel.startRow && y <= sel.endRow) {
+      selStart = y === sel.startRow ? sel.startCol : 0;
+      selEnd = y === sel.endRow ? sel.endCol : (line ? line.length - 1 : 0);
+    }
+    ha = Math.imul(ha ^ (selStart + 1), 0x01000193);
+    hb = Math.imul(hb ^ (selEnd + 1), 0x85ebca6b);
+
     a[y] = ha | 0;
     b[y] = hb | 0;
     return complex;
@@ -981,13 +1008,49 @@ export class CanvasRenderer {
     // This is used by isInSelection() to determine if a cell needs selection colors
     this.currentSelectionCoords = hasSelection ? this.selectionManager!.getSelectionCoords() : null;
 
-    // Mark current selection rows for redraw (includes programmatic selections)
-    if (this.currentSelectionCoords) {
-      const coords = this.currentSelectionCoords;
-      for (let row = coords.startRow; row <= coords.endRow; row++) {
-        selectionRows.add(row);
+    // Repaint the rows whose selection appearance changed since the last
+    // frame, not the whole selection.
+    //
+    // Repainting every selected row every frame made a drag cost one repaint
+    // per selected row per frame, which dominated drag cost and made the
+    // dirty-row tracking in SelectionManager dead weight — whatever it
+    // reported, the full range was re-added here anyway. Rows strictly inside
+    // a selection look identical from frame to frame; only rows that joined or
+    // left it, and the endpoint rows whose column extent moved, actually
+    // change. Diffing here rather than trusting SelectionManager's dirty set
+    // alone also keeps programmatic selections correct, since selectAll() and
+    // select() never went through the drag path that marks rows dirty.
+    const prevSel = this.previousSelectionCoords;
+    const curSel = this.currentSelectionCoords;
+    const selectionMoved =
+      (prevSel === null) !== (curSel === null) ||
+      (prevSel !== null &&
+        curSel !== null &&
+        (prevSel.startRow !== curSel.startRow ||
+          prevSel.endRow !== curSel.endRow ||
+          prevSel.startCol !== curSel.startCol ||
+          prevSel.endCol !== curSel.endCol));
+
+    if (selectionMoved) {
+      if (prevSel === null || curSel === null) {
+        const range = prevSel ?? curSel!;
+        for (let row = range.startRow; row <= range.endRow; row++) selectionRows.add(row);
+      } else {
+        const lo = Math.min(prevSel.startRow, curSel.startRow);
+        const hi = Math.max(prevSel.endRow, curSel.endRow);
+        for (let row = lo; row <= hi; row++) {
+          const was = row >= prevSel.startRow && row <= prevSel.endRow;
+          const is = row >= curSel.startRow && row <= curSel.endRow;
+          if (was !== is) selectionRows.add(row);
+        }
+        selectionRows.add(prevSel.startRow);
+        selectionRows.add(prevSel.endRow);
+        selectionRows.add(curSel.startRow);
+        selectionRows.add(curSel.endRow);
       }
     }
+
+    this.previousSelectionCoords = curSel === null ? null : { ...curSel };
 
     // Always mark dirty selection rows for redraw (to clear old overlay)
     if (this.selectionManager) {
@@ -1068,8 +1131,12 @@ export class CanvasRenderer {
     // drag them along with the rows beneath them. They are absent during the
     // bulk output that the blit exists to speed up, so skip the fast path
     // rather than trying to reposition them.
+    // Selection is deliberately absent here: its per-row extent is part of the
+    // row hash, so a changed highlight fails verification and gets repainted
+    // like any other change. The rest stay — hover underlines and kitty
+    // placements paint outside the hashed cell data, so a moved row could
+    // carry them stale with nothing to catch it.
     const hasOverlays =
-      Boolean(hasSelection) ||
       this.currentDirectPlacements.length > 0 ||
       this.kittyVirtualPlacements.size > 0 ||
       this.hoveredHyperlinkId > 0 ||
@@ -1085,7 +1152,15 @@ export class CanvasRenderer {
       !needsResize &&
       dimsUnchanged &&
       !hasOverlays &&
-      scrollShift !== 0 &&
+      // A zero shift is worth taking when scrolled, because the fallback there
+      // repaints the entire viewport on the grounds that per-row dirty flags
+      // describe the screen and not the view. Holding still in scrollback is
+      // the common case — reading, or dragging out a selection — and nothing
+      // has moved, so hash verification retains every row and only genuinely
+      // changed ones get painted. At the bottom a zero shift already lands on
+      // the dirty-flag path, which is cheaper than hashing the frame, so leave
+      // that alone.
+      (scrollShift !== 0 || viewportY > 0) &&
       Math.abs(scrollShift) < dims.rows
     ) {
       // Hash the whole frame so retained rows can be verified against the
@@ -1124,7 +1199,12 @@ export class CanvasRenderer {
       // Repainting most of the viewport on top of a blit costs more than just
       // drawing the frame, so bail out when the hypothesis mostly failed.
       const retained = lastRetained - firstRetained - mismatched.length;
-      if (retained > dims.rows / 2 && this.blitRows(scrollShift, dims.cols, dims.rows)) {
+      // Nothing to move at zero shift; the pixels are already where they
+      // belong, so skip the full-canvas self-copy blitRows would perform.
+      if (
+        retained > dims.rows / 2 &&
+        (scrollShift === 0 || this.blitRows(scrollShift, dims.cols, dims.rows))
+      ) {
         blitted = true;
         this.shiftCanvasHashes(scrollShift, dims.rows);
 
@@ -2324,6 +2404,19 @@ export class CanvasRenderer {
    */
   public setOnRequestRender(fn: (() => void) | null): void {
     this.onRequestRender = fn;
+  }
+
+  /**
+   * Wake the host's render scheduler.
+   *
+   * For collaborators that change what should be on screen without going
+   * through a write. Nothing schedules a frame on its own, so a selection drag
+   * over an idle terminal would otherwise only repaint when something else
+   * happened to request a frame — in practice the 530ms cursor blink, which
+   * is two updates a second no matter how fast the pointer moves.
+   */
+  public requestRender(): void {
+    this.onRequestRender?.();
   }
 
   private startCursorBlink(): void {
