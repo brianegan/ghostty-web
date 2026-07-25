@@ -13,8 +13,8 @@ import type { IBufferRange, ILink, ILinkProvider } from '../types';
 /**
  * URL Regex Provider
  *
- * Detects plain text URLs on a single line using regex.
- * Does not support multi-line URLs or file paths.
+ * Detects plain text URLs using regex, following soft wraps so a URL longer
+ * than the terminal is wide is still found whole. Does not detect file paths.
  *
  * Supported protocols:
  * - https://, http://
@@ -46,14 +46,48 @@ export class UrlRegexProvider implements ILinkProvider {
   provideLinks(y: number, callback: (links: ILink[] | undefined) => void): void {
     const links: ILink[] = [];
 
-    const line = this.terminal.buffer.active.getLine(y);
-    if (!line) {
+    // Assemble the whole logical line, not just this row.
+    //
+    // A URL longer than the terminal is wide soft-wraps across rows. Scanning a
+    // single row found a "URL" truncated at exactly the terminal width, which
+    // still looked clickable and often still resolved, just to the wrong place.
+    // The continuation rows started mid-query-string and matched nothing at
+    // all, so the back half of a wrapped link was simply dead.
+    //
+    // isWrapped marks a row as a continuation of the one above, so walking back
+    // while it is set finds the logical start, and walking forward while the
+    // next row has it finds the end.
+    const buffer = this.terminal.buffer.active;
+
+    let startY = y;
+    while (startY > 0 && buffer.getLine(startY)?.isWrapped) startY--;
+
+    const rows: { y: number; text: string; length: number }[] = [];
+    for (let row = startY; ; row++) {
+      const line = buffer.getLine(row);
+      if (!line) break;
+      rows.push({ y: row, text: this.lineToText(line), length: line.length });
+      const next = buffer.getLine(row + 1);
+      if (!next?.isWrapped) break;
+    }
+
+    if (rows.length === 0) {
       callback(undefined);
       return;
     }
 
-    // Convert line cells to text
-    const lineText = this.lineToText(line);
+    const lineText = rows.map((r) => r.text).join('');
+
+    // Offset in the joined text back to a row and column.
+    const locate = (offset: number): { x: number; y: number } => {
+      let remaining = offset;
+      for (const row of rows) {
+        if (remaining < row.length) return { x: remaining, y: row.y };
+        remaining -= row.length;
+      }
+      const last = rows[rows.length - 1]!;
+      return { x: last.length - 1, y: last.y };
+    };
 
     // Reset regex state (global flag maintains state)
     UrlRegexProvider.URL_REGEX.lastIndex = 0;
@@ -89,8 +123,8 @@ export class UrlRegexProvider implements ILinkProvider {
         links.push({
           text: url,
           range: {
-            start: { x: startX, y },
-            end: { x: endX, y },
+            start: locate(startX),
+            end: locate(endX),
           },
           activate: (event) => {
             // Open link if Ctrl/Cmd is pressed
@@ -154,6 +188,8 @@ export interface ITerminalForUrlProvider {
  */
 interface IBufferLineForUrlProvider {
   length: number;
+  /** True when this row is a continuation of the one above it. */
+  isWrapped?: boolean;
   getCell(x: number):
     | {
         getCodepoint(): number;

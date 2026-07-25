@@ -3886,3 +3886,70 @@ describe('getScrollbackLines', () => {
     term.dispose();
   });
 });
+
+describe('wrapped URL detection', () => {
+  let container: HTMLElement | null = null;
+
+  beforeEach(() => {
+    if (typeof document !== 'undefined') {
+      container = document.createElement('div');
+      document.body.appendChild(container);
+    }
+  });
+
+  afterEach(() => {
+    if (container?.parentNode) {
+      container.parentNode.removeChild(container);
+      container = null;
+    }
+  });
+
+  // A URL longer than the terminal is wide soft-wraps across rows. Scanning one
+  // row at a time found a URL truncated at exactly the terminal width, which
+  // still looked clickable and often still resolved, just to somewhere other
+  // than intended. Continuation rows started mid-query-string and matched
+  // nothing, so the back half of the link was dead.
+  test('a soft-wrapped URL is found whole from either row', async () => {
+    if (!container) return;
+
+    const url =
+      'http://localhost:8777/harness/?cast=/harness/fixtures/synthetic.cast' +
+      '&repro=drag&loop=0&lockat=20&profile=1&pipeline=raf&preserve=1';
+    expect(url.length).toBeGreaterThan(80);
+
+    const term = await createIsolatedTerminal({ cols: 80, rows: 10, scrollback: 100 });
+    term.open(container);
+    term.write(`${url}\r\n`);
+
+    const detector = (term as unknown as {
+      linkDetector: { getLinkAt(col: number, row: number): Promise<{ text: string } | undefined> };
+    }).linkDetector;
+
+    // Row 1 is the continuation; row 0 is where the URL starts.
+    const onFirstRow = await detector.getLinkAt(10, 0);
+    const onSecondRow = await detector.getLinkAt(10, 1);
+
+    expect(onFirstRow?.text).toBe(url);
+    expect(onSecondRow?.text).toBe(url);
+
+    term.dispose();
+  });
+
+  test('an unwrapped URL still stops at its own line', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({ cols: 80, rows: 10, scrollback: 100 });
+    term.open(container);
+    // Two short URLs on separate hard-wrapped lines must not be joined.
+    term.write('http://example.com/one\r\nhttp://example.com/two\r\n');
+
+    const detector = (term as unknown as {
+      linkDetector: { getLinkAt(col: number, row: number): Promise<{ text: string } | undefined> };
+    }).linkDetector;
+
+    expect((await detector.getLinkAt(5, 0))?.text).toBe('http://example.com/one');
+    expect((await detector.getLinkAt(5, 1))?.text).toBe('http://example.com/two');
+
+    term.dispose();
+  });
+});
