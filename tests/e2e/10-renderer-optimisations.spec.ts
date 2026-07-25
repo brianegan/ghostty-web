@@ -505,3 +505,87 @@ test('clearing a hovered link underline survives the blit', async ({ page }) => 
   expect(result.maxDelta).toBe(0);
   expect(result.diff).toBe(0);
 });
+
+// Two OSC8 links on screen, hovering one. cell.hyperlink_id is 1 for any
+// hyperlinked cell rather than a per-link identity, so drawing the underline by
+// comparing it against the hovered id lit every link at once. The giveaway is
+// that hovering the first link and hovering the second produced identical
+// output; with the underline driven by the hovered link's real extent they
+// must differ.
+test('hovering one link underlines only that link', async ({ page }) => {
+  page.on('pageerror', (e) => console.error('PAGE ERROR:', e.message));
+  await page.goto('/demo/', { waitUntil: 'networkidle' });
+
+  const result = await page.evaluate(async () => {
+    const { CanvasRenderer } = await import('/lib/renderer.ts');
+
+    const COLS = 30;
+    const ROWS = 6;
+
+    const mk = (ch: string, hyperlink: boolean) => ({
+      codepoint: ch.codePointAt(0) ?? 32,
+      fg_r: 212, fg_g: 212, fg_b: 212,
+      bg_r: 30, bg_g: 30, bg_b: 30,
+      fgIsDefault: true, bgIsDefault: true,
+      flags: 0, width: 1,
+      hyperlink_id: hyperlink ? 1 : 0,
+      grapheme_len: 0,
+    });
+    type Cell = ReturnType<typeof mk>;
+
+    // Rows 1 and 3 are links; identical text so any difference between the two
+    // captures has to come from which one is underlined.
+    const screen: Cell[][] = [];
+    for (let y = 0; y < ROWS; y++) {
+      const isLink = y === 1 || y === 3;
+      const text = isLink ? 'https://example.com/x'.padEnd(COLS) : `plain row ${y}`.padEnd(COLS);
+      screen.push([...text.slice(0, COLS)].map((ch, x) => mk(ch, isLink && x < 21)));
+    }
+
+    const buffer = {
+      getLine: (y: number) => screen[y] ?? null,
+      getViewportLines: () => screen.slice(),
+      getCursor: () => ({ x: 0, y: 0, visible: false }),
+      getDimensions: () => ({ cols: COLS, rows: ROWS }),
+      isRowDirty: () => true,
+      needsFullRedraw: () => false,
+      clearDirty: () => {},
+      getGraphemeString: (y: number, x: number) =>
+        String.fromCodePoint(screen[y]?.[x]?.codepoint || 32),
+    };
+    const scrollback = { getScrollbackLength: () => 0, getScrollbackLine: () => null };
+
+    const renderHovering = (row: number) => {
+      const canvas = document.createElement('canvas');
+      document.body.appendChild(canvas);
+      const r = new CanvasRenderer(canvas, {
+        fontSize: 15, fontFamily: 'monospace', devicePixelRatio: 2,
+      });
+      r.resize(COLS, ROWS);
+      // Both are set the way a real hover does: the id says "a link is hovered",
+      // the range says which one.
+      r.setHoveredHyperlinkId(1);
+      r.setHoveredLinkRange({ startX: 0, startY: row, endX: 20, endY: row });
+      r.render(buffer as never, true, 0, scrollback as never, 0);
+      const ctx = canvas.getContext('2d')!;
+      const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      return Array.from(img.data);
+    };
+
+    const hoverFirst = renderHovering(1);
+    const hoverSecond = renderHovering(3);
+
+    let diff = 0;
+    for (let i = 0; i < hoverFirst.length; i += 4) {
+      let d = 0;
+      for (let c = 0; c < 4; c++) d = Math.max(d, Math.abs(hoverFirst[i + c] - hoverSecond[i + c]));
+      if (d > 0) diff++;
+    }
+    return { diff, total: hoverFirst.length / 4 };
+  });
+
+  console.log(JSON.stringify(result));
+
+  // Identical output would mean both links were underlined in both cases.
+  expect(result.diff).toBeGreaterThan(0);
+});
