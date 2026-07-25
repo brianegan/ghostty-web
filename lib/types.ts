@@ -458,6 +458,20 @@ export interface GhosttyWasmExports extends WebAssembly.Exports {
   ): number;
   // Per-cell direct access. GhosttyCell is a u64 — passed as bigint in JS.
   ghostty_cell_get(cell: bigint, key: number, outPtr: number): number;
+  /**
+   * Read several fields of one cell in a single crossing. `keysPtr` is an
+   * array of `count` CellData values, `valuesPtr` an array of `count`
+   * pointers to receive them, and `writtenPtr` receives how many succeeded
+   * (it stops at the first failure). Reading codepoint, width and hyperlink
+   * separately costs three crossings per cell; this costs one.
+   */
+  ghostty_cell_get_multi(
+    cell: bigint,
+    count: number,
+    keysPtr: number,
+    valuesPtr: number,
+    writtenPtr: number
+  ): number;
   // Per-row direct access. GhosttyRow is a u64 — passed as bigint in JS.
   ghostty_row_get(row: bigint, key: number, outPtr: number): number;
   // Grid references: read cells / rows / graphemes / hyperlinks at a
