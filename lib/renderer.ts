@@ -1599,23 +1599,14 @@ export class CanvasRenderer {
       this.ctx.stroke();
     }
 
-    // Draw hyperlink underline (for OSC8 hyperlinks)
-    if (cell.hyperlink_id > 0) {
-      const isHovered = cell.hyperlink_id === this.hoveredHyperlinkId;
-
-      // Only show underline when hovered (cleaner look)
-      if (isHovered) {
-        const underlineY = cellY + this.metrics.baseline + 2;
-        this.ctx.strokeStyle = '#4A90E2'; // Blue underline on hover
-        this.ctx.lineWidth = 1;
-        this.ctx.beginPath();
-        this.ctx.moveTo(cellX, underlineY);
-        this.ctx.lineTo(cellX + cellWidth, underlineY);
-        this.ctx.stroke();
-      }
-    }
-
-    // Draw regex link underline (for plain text URLs)
+    // Underline the hovered link, OSC8 and plain text alike.
+    //
+    // OSC8 links used to be drawn separately by comparing cell.hyperlink_id
+    // against the hovered id. Both read paths set that field to 1 for any
+    // hyperlinked cell rather than to a per-link identity, so hovering one link
+    // matched every hyperlinked cell on screen and lit all of them at once.
+    // hoveredLinkRange is the hovered link's actual extent, resolved by URI and
+    // position, and covers both kinds.
     if (this.hoveredLinkRange) {
       const range = this.hoveredLinkRange;
       // Check if this cell is within the hovered link range
