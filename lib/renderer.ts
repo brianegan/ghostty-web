@@ -470,6 +470,27 @@ export class CanvasRenderer {
   }
 
   /**
+   * Toggle glyph caching at runtime so it can be A/B'd against fillText on a
+   * live terminal. Disabling drops the atlas rather than leaving it allocated;
+   * re-enabling rebuilds it lazily on the next cell that needs it.
+   *
+   * Note this cannot revive an atlas that disabled itself after repeated
+   * repacks, or one that never had an offscreen context to build in. Those
+   * clear glyphAtlasEnabled, and setting it back to true will simply fail the
+   * same way on the next attempt.
+   */
+  public setGlyphAtlas(enabled: boolean): void {
+    if (this.glyphAtlasEnabled === enabled) return;
+    this.glyphAtlasEnabled = enabled;
+    if (!enabled) this.invalidateGlyphAtlas();
+  }
+
+  /** Toggle scroll blitting at runtime. Off means every frame is a repaint. */
+  public setScrollBlit(enabled: boolean): void {
+    this.scrollBlitEnabled = enabled;
+  }
+
+  /**
    * The atlas for the current font, building it on first use. Returns null when
    * atlas rendering is off or the atlas has given up on caching, in which case
    * callers draw text with fillText.
@@ -1238,7 +1259,9 @@ export class CanvasRenderer {
     if (viewportY === 0 && cursor.visible && this.cursorVisible) {
       // Use cursor style from buffer if provided, otherwise use renderer default
       const cursorStyle = cursor.style ?? this.cursorStyle;
-      this.renderCursor(cursor.x, cursor.y, cursorStyle);
+      // Hand over the cached row: renderCursor needs the cell under the cursor
+      // and fetching it itself would walk the whole viewport again.
+      this.renderCursor(cursor.x, cursor.y, cursorStyle, lineAt(cursor.y));
     }
 
     // Render scrollbar if scrolled or scrollback exists (with opacity for fade effect)
@@ -2235,8 +2258,18 @@ export class CanvasRenderer {
 
   /**
    * Render cursor
+   *
+   * `line` is the cursor row, supplied by the caller because it already has the
+   * frame's rows cached. Fetching it here instead cost a full viewport walk per
+   * frame, since getLine() on the WASM terminal reads every cell of every row
+   * to return one of them.
    */
-  private renderCursor(x: number, y: number, style?: 'block' | 'underline' | 'bar'): void {
+  private renderCursor(
+    x: number,
+    y: number,
+    style?: 'block' | 'underline' | 'bar',
+    line?: GhosttyCell[] | null
+  ): void {
     const cursorX = x * this.metrics.width;
     const cursorY = y * this.metrics.height;
     const cursorStyle = style ?? this.cursorStyle;
@@ -2249,7 +2282,6 @@ export class CanvasRenderer {
         this.ctx.fillRect(cursorX, cursorY, this.metrics.width, this.metrics.height);
         // Re-draw character under cursor with cursorAccent color
         {
-          const line = this.currentBuffer?.getLine(y);
           if (line?.[x]) {
             this.ctx.save();
             this.ctx.beginPath();

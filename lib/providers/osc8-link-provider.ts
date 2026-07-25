@@ -123,12 +123,13 @@ export class OSC8LinkProvider implements ILinkProvider {
     let minY = startY;
     let minX = startX;
 
-    // Scan backwards on current line
-    while (minX > 0) {
-      const line = buffer.getLine(minY);
-      if (!line) break;
-
-      const cell = line.getCell(minX - 1);
+    // Scan backwards on current line. The row is fetched once, outside the
+    // loop: getLine() reads every cell of every row on the WASM terminal, so
+    // re-fetching per column made scanning a long link quadratic. Mirrors how
+    // the forward scan below is written.
+    const startLine = buffer.getLine(minY);
+    while (startLine && minX > 0) {
+      const cell = startLine.getCell(minX - 1);
       if (!cell || cell.getHyperlinkId() !== hyperlinkId) break;
       minX--;
     }
