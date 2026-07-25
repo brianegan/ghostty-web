@@ -163,6 +163,36 @@ export class Buffer implements IBuffer {
     }
   }
 
+  /**
+   * Screen rows from one bulk viewport fetch, cached for the current
+   * synchronous burst only.
+   *
+   * The cache is dropped on the next microtask checkpoint, so it can never
+   * outlive the task that built it. Nothing mutates the WASM buffer partway
+   * through a synchronous call stack — writes come from JS too — which makes
+   * this safe by construction while still collapsing the multi-row scans the
+   * OSC8 and URL providers do per hover into a single walk.
+   */
+  private screenLineCache: (GhosttyCell[] | null)[] | null = null;
+  private screenLineCacheScheduled = false;
+
+  private getScreenLineCached(wasmTerm: any, lineNumber: number): GhosttyCell[] | null {
+    if (typeof wasmTerm.getViewportLines !== 'function') {
+      return wasmTerm.getLine(lineNumber);
+    }
+    if (!this.screenLineCache) {
+      this.screenLineCache = wasmTerm.getViewportLines();
+      if (!this.screenLineCacheScheduled) {
+        this.screenLineCacheScheduled = true;
+        queueMicrotask(() => {
+          this.screenLineCache = null;
+          this.screenLineCacheScheduled = false;
+        });
+      }
+    }
+    return this.screenLineCache?.[lineNumber] ?? null;
+  }
+
   getLine(y: number): IBufferLine | undefined {
     const wasmTerm = this.getWasmTerm();
     if (!wasmTerm) return undefined;
@@ -189,9 +219,15 @@ export class Buffer implements IBuffer {
       // For now, assume not wrapped
       isWrapped = false;
     } else {
-      // Accessing visible screen
+      // Accessing visible screen.
+      //
+      // getLine() on the WASM terminal walks the whole viewport to return one
+      // row. Link detection calls through here on every mouse move, and the
+      // OSC8 and URL providers scan several rows per lookup, so each hover was
+      // paying repeated full walks. Serve screen rows from one bulk fetch
+      // instead, cached for as long as the underlying frame is unchanged.
       lineNumber = this.bufferType === 'normal' ? y - scrollbackLength : y;
-      cells = wasmTerm.getLine(lineNumber);
+      cells = this.getScreenLineCached(wasmTerm, lineNumber);
       isWrapped = wasmTerm.isRowWrapped(lineNumber);
     }
 

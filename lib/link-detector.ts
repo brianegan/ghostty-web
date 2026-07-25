@@ -38,13 +38,18 @@ export class LinkDetector {
    * @returns Link at position, or undefined if none
    */
   async getLinkAt(col: number, row: number): Promise<ILink | undefined> {
-    const line = this.terminal.buffer.active.getLine(row);
-    if (!line || col < 0 || col >= line.length) {
+    // Bounds-check without fetching the row.
+    //
+    // This used to call buffer.active.getLine(row), which walks the entire
+    // viewport out of WASM, purely to read line.length and null-check a cell
+    // whose value was then never used. Hover runs this on every mouse move, so
+    // it cost ~1.8ms per move and was the entire measured cost of link
+    // detection during a drag. A row is exactly cols wide, and buffer.length
+    // is scrollback plus rows, so both checks are arithmetic.
+    if (col < 0 || col >= this.terminal.cols) {
       return undefined;
     }
-
-    const cell = line.getCell(col);
-    if (!cell) {
+    if (row < 0 || row >= this.terminal.buffer.active.length) {
       return undefined;
     }
 
@@ -198,8 +203,10 @@ export class LinkDetector {
  * Keeps coupling low and testing easy
  */
 export interface ITerminalForLinkDetector {
+  cols: number;
   buffer: {
     active: {
+      length: number;
       getLine(y: number):
         | {
             length: number;
