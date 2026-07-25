@@ -292,6 +292,12 @@ export class GhosttyTerminal {
   /** Cell pool for zero-allocation rendering */
   private cellPool: GhosttyCell[] = [];
 
+  // Shared per-generation viewport fetch. contentGeneration advances on write
+  // and resize; anything else leaves the screen as it was.
+  private contentGeneration = 0;
+  private viewportLinesCache: (GhosttyCell[] | null)[] | null = null;
+  private viewportLinesGeneration = -1;
+
   /**
    * Cell pixel dimensions last pushed to the WASM terminal via
    * ghostty_terminal_resize. Zero means "unknown / disabled" — kitty
@@ -646,6 +652,7 @@ export class GhosttyTerminal {
   // ==========================================================================
 
   write(data: string | Uint8Array): void {
+    this.contentGeneration++;
     const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data;
     const ptr = this.exports.ghostty_wasm_alloc_u8_array(bytes.length);
     new Uint8Array(this.memory.buffer).set(bytes, ptr);
@@ -655,6 +662,7 @@ export class GhosttyTerminal {
 
   resize(cols: number, rows: number): void {
     if (cols === this._cols && rows === this._rows) return;
+    this.contentGeneration++;
     this._cols = cols;
     this._rows = rows;
     this.exports.ghostty_terminal_resize(
@@ -1455,6 +1463,22 @@ export class GhosttyTerminal {
    * references would alias whatever is fetched next.
    */
   getViewportLines(): (GhosttyCell[] | null)[] {
+    // Three separate callers each want the screen every frame: the renderer
+    // painting it, the hover hit-test reading one cell's hyperlink id, and the
+    // buffer API behind link detection. Each kept its own cache and so each
+    // did its own bulk fetch — around 2.3 walks a frame during a drag, which
+    // was most of the frame. They can share one, because the screen only
+    // changes when something writes to the terminal or it resizes.
+    if (this.viewportLinesGeneration === this.contentGeneration && this.viewportLinesCache) {
+      return this.viewportLinesCache;
+    }
+    const lines = this.readViewportLines();
+    this.viewportLinesCache = lines;
+    this.viewportLinesGeneration = this.contentGeneration;
+    return lines;
+  }
+
+  private readViewportLines(): (GhosttyCell[] | null)[] {
     this.update();
     const viewport = this.getViewport();
     const lines = new Array<GhosttyCell[] | null>(this._rows);
