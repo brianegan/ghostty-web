@@ -32,6 +32,17 @@ export interface ITerminalOptions {
    */
   preserveScrollOnWrite?: boolean;
 
+  // Renderer optimisations. Both default to true; turn one off to isolate it
+  // when chasing a rendering artefact or measuring its contribution.
+  //
+  /** Cache rasterised glyphs and composite with drawImage instead of fillText. */
+  glyphAtlas?: boolean;
+  /**
+   * When the viewport scrolls, move the pixels that are already correct with a
+   * single blit and repaint only the newly exposed rows.
+   */
+  scrollBlit?: boolean;
+
   // Emit terminal-generated responses through onData (default: true)
   //
   // Some host applications answer terminal queries at the PTY boundary instead

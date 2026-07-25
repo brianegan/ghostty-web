@@ -86,6 +86,8 @@ export class TerminalCore implements IDisposable {
       focusOnOpen: options.focusOnOpen ?? true,
       preserveScrollOnWrite: options.preserveScrollOnWrite ?? false,
       emitTerminalResponses: options.emitTerminalResponses ?? true,
+      glyphAtlas: options.glyphAtlas ?? true,
+      scrollBlit: options.scrollBlit ?? true,
     };
 
     (this.options as any) = new Proxy(baseOptions, {
