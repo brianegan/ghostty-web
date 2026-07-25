@@ -3953,3 +3953,116 @@ describe('wrapped URL detection', () => {
     term.dispose();
   });
 });
+
+describe('hover refresh when content moves', () => {
+  let container: HTMLElement | null = null;
+
+  beforeEach(() => {
+    if (typeof document !== 'undefined') {
+      container = document.createElement('div');
+      document.body.appendChild(container);
+    }
+  });
+
+  afterEach(() => {
+    if (container?.parentNode) {
+      container.parentNode.removeChild(container);
+      container = null;
+    }
+  });
+
+  // Hover was only ever recomputed on mousemove, so scrolling with the mouse
+  // held still left the link underline drawn over whatever scrolled into that
+  // spot. Streaming output at the bottom does the same without viewportY
+  // changing at all, so both signals have to invalidate the hover.
+  test('re-resolves on scroll and on new output, but not when nothing moved', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({ cols: 40, rows: 6, scrollback: 500 });
+    term.open(container);
+    for (let i = 0; i < 40; i++) term.write(`line ${i} http://example.com/${i}\r\n`);
+
+    const t = term as unknown as {
+      lastPointer?: { clientX: number; clientY: number };
+      currentHoveredLink?: unknown;
+      hoverResolvedAgainst: string;
+      hoverViewKey(): string;
+      refreshHoverForMovedContent(): void;
+      processMouseMove(e: MouseEvent): void;
+    };
+
+    let resolves = 0;
+    const original = t.processMouseMove.bind(t);
+    t.processMouseMove = (e: MouseEvent) => {
+      resolves++;
+      original(e);
+    };
+
+    // A pointer resting on the terminal, over a link.
+    t.lastPointer = { clientX: 5, clientY: 5 };
+    t.currentHoveredLink = { text: 'http://example.com/0' };
+    t.hoverResolvedAgainst = t.hoverViewKey();
+
+    // Nothing has moved, so there is nothing to redo.
+    t.refreshHoverForMovedContent();
+    expect(resolves).toBe(0);
+
+    // Scrolling moves different rows under the same pointer.
+    term.scrollLines(-5);
+    t.refreshHoverForMovedContent();
+    expect(resolves).toBe(1);
+
+    // And again only if something changed since.
+    t.refreshHoverForMovedContent();
+    expect(resolves).toBe(1);
+
+    // Output at the bottom moves content without changing viewportY.
+    t.hoverResolvedAgainst = t.hoverViewKey();
+    term.write('more output\r\n');
+    t.refreshHoverForMovedContent();
+    expect(resolves).toBe(2);
+
+    // Drive it the way the terminal actually does, through the render loop, so
+    // this fails if the call site there is ever dropped rather than only if the
+    // method disappears.
+    t.hoverResolvedAgainst = t.hoverViewKey();
+    term.scrollLines(-3);
+    (term as unknown as { renderTick(): void }).renderTick();
+    expect(resolves).toBe(3);
+
+    term.dispose();
+  });
+
+  test('does nothing when no link is hovered', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({ cols: 40, rows: 6, scrollback: 500 });
+    term.open(container);
+    for (let i = 0; i < 40; i++) term.write(`line ${i}\r\n`);
+
+    const t = term as unknown as {
+      lastPointer?: { clientX: number; clientY: number };
+      hoverResolvedAgainst: string;
+      hoverViewKey(): string;
+      refreshHoverForMovedContent(): void;
+      processMouseMove(e: MouseEvent): void;
+    };
+
+    let resolves = 0;
+    const original = t.processMouseMove.bind(t);
+    t.processMouseMove = (e: MouseEvent) => {
+      resolves++;
+      original(e);
+    };
+
+    // Pointer present, but nothing under it. Scrolling must not start doing
+    // hover work on every frame just because the view moved.
+    t.lastPointer = { clientX: 5, clientY: 5 };
+    t.hoverResolvedAgainst = t.hoverViewKey();
+    term.scrollLines(-5);
+    t.refreshHoverForMovedContent();
+    expect(resolves).toBe(0);
+
+    term.dispose();
+  });
+});
