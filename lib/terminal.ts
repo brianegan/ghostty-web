@@ -249,6 +249,21 @@ export class Terminal extends TerminalCore {
         }
         break;
 
+      // Toggling either changes how pixels are produced, not what they should
+      // be, so force one full repaint to resynchronise. The blit in particular
+      // reasons from the previous frame's canvas, and turning it on mid-run
+      // means it has no verified prior state to trust.
+      case 'glyphAtlas':
+      case 'scrollBlit':
+        if (this.renderer) {
+          this.renderer.setGlyphAtlas(this.options.glyphAtlas !== false);
+          this.renderer.setScrollBlit(this.options.scrollBlit !== false);
+          if (this.wasmTerm) {
+            this.renderer.render(this.wasmTerm, true, this.viewportY, this, this.scrollbarOpacity);
+          }
+        }
+        break;
+
       case 'theme':
         if (this.renderer && this.wasmTerm) {
           const incoming = newValue && typeof newValue === 'object' ? newValue : {};
@@ -405,6 +420,8 @@ export class Terminal extends TerminalCore {
         cursorStyle: this.options.cursorStyle,
         cursorBlink: this.options.cursorBlink,
         theme: this.options.theme,
+        glyphAtlas: this.options.glyphAtlas,
+        scrollBlit: this.options.scrollBlit,
       });
 
       this.renderer.resize(this.cols, this.rows);
