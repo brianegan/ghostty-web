@@ -1,0 +1,243 @@
+import { expect, test } from '@playwright/test';
+
+// Guards the renderer's two drawing optimisations against regressions by
+// rendering identical content with each one switched on and off.
+//
+// The glyph atlas and the scroll blit are both invisible when they work and
+// produce subtly wrong output when they don't — a glyph off by a pixel, a row
+// of stale text after a scroll — which behavioural tests would not catch. So
+// this compares bitmaps directly.
+test('glyph atlas and scroll blit match the unoptimised paths', async ({ page }) => {
+  page.on('pageerror', (e) => console.error('PAGE ERROR:', e.message));
+  await page.goto('/demo/', { waitUntil: 'networkidle' });
+
+  const result = await page.evaluate(async () => {
+    const { CanvasRenderer } = await import('/lib/renderer.ts');
+
+    const COLS = 60;
+    const ROWS = 20;
+    const TOTAL_LINES = 200;
+
+    const mk = (ch: string, o: Record<string, unknown> = {}) => ({
+      codepoint: ch.codePointAt(0) ?? 32,
+      fg_r: 212,
+      fg_g: 212,
+      fg_b: 212,
+      bg_r: 30,
+      bg_g: 30,
+      bg_b: 30,
+      fgIsDefault: true,
+      bgIsDefault: true,
+      flags: 0,
+      width: 1,
+      hyperlink_id: 0,
+      grapheme_len: 0,
+      ...o,
+    });
+
+    // Flags mirror CellFlags in lib/types.ts.
+    const BOLD = 1 << 0;
+    const ITALIC = 1 << 1;
+    const UNDERLINE = 1 << 2;
+    const INVERSE = 1 << 4;
+    const STRIKETHROUGH = 1 << 6;
+    const FAINT = 1 << 7;
+
+    type Cell = ReturnType<typeof mk>;
+
+    // A stable corpus of absolute lines. Each carries its own index in the text
+    // so a row landing at the wrong offset after a blit is unmissable, and the
+    // styles cycle through every path the atlas has to reproduce.
+    const corpus: Cell[][] = [];
+    for (let n = 0; n < TOTAL_LINES; n++) {
+      const label = `line ${n} `;
+      const row: Cell[] = [];
+      const variant = n % 9;
+      for (let x = 0; x < COLS; x++) {
+        if (x < label.length) {
+          row.push(mk(label[x]));
+          continue;
+        }
+        const k = (x + n) % 10;
+        switch (variant) {
+          case 0:
+            row.push(mk(String.fromCharCode(33 + ((x * 3) % 90))));
+            break;
+          case 1:
+            row.push(mk('B', { flags: BOLD }));
+            break;
+          case 2:
+            row.push(mk('i', { flags: ITALIC }));
+            break;
+          case 3:
+            row.push(mk('u', { flags: UNDERLINE }));
+            break;
+          case 4:
+            row.push(mk('s', { flags: STRIKETHROUGH }));
+            break;
+          case 5:
+            row.push(mk('v', { flags: INVERSE }));
+            break;
+          case 6:
+            row.push(mk('f', { flags: FAINT }));
+            break;
+          case 7:
+            row.push(
+              mk('C', {
+                fg_r: 20 + k * 20,
+                fg_g: 200 - k * 10,
+                fg_b: 80 + k * 15,
+                fgIsDefault: false,
+                bg_r: k * 10,
+                bg_g: 40,
+                bg_b: 90,
+                bgIsDefault: false,
+              })
+            );
+            break;
+          default:
+            row.push(x % 3 === 0 ? mk(' ') : x % 3 === 1 ? mk('▀') : mk('T'));
+        }
+      }
+      corpus.push(row);
+    }
+
+    /**
+     * Buffer view over the corpus for a given scroll position: the screen shows
+     * absolute lines [first, first + ROWS), scrollback holds everything before
+     * it. Mirrors how a real terminal reports a stream of output at the bottom.
+     */
+    const makeView = (first: number) => {
+      const screen: Cell[][] = [];
+      for (let y = 0; y < ROWS; y++) screen.push(corpus[first + y] ?? []);
+      return {
+        buffer: {
+          getLine: (y: number) => screen[y] ?? null,
+          getViewportLines: () => screen.slice(),
+          getCursor: () => ({ x: 0, y: 0, visible: false }),
+          getDimensions: () => ({ cols: COLS, rows: ROWS }),
+          // A scroll relocates every row, which is exactly what a real
+          // terminal reports: the whole viewport is dirty.
+          isRowDirty: () => true,
+          needsFullRedraw: () => false,
+          clearDirty: () => {},
+          getGraphemeString: (y: number, x: number) =>
+            String.fromCodePoint(screen[y]?.[x]?.codepoint || 32),
+        },
+        scrollback: {
+          getScrollbackLength: () => first,
+          getScrollbackLine: (offset: number) => corpus[offset] ?? null,
+        },
+      };
+    };
+
+    // Count painted rows by intercepting the per-row clearRect that renderLine
+    // issues. Row clears are identifiable by their height matching a cell.
+    let rowClears = 0;
+    let countHeight = 0;
+    const origClearRect = CanvasRenderingContext2D.prototype.clearRect;
+    CanvasRenderingContext2D.prototype.clearRect = function (
+      x: number,
+      y: number,
+      w: number,
+      h: number
+    ) {
+      if (countHeight > 0 && x === 0 && Math.abs(h - countHeight) < 0.001) rowClears++;
+      return origClearRect.call(this, x, y, w, h);
+    };
+
+    const runStream = (opts: Record<string, unknown>, frames: number) => {
+      const canvas = document.createElement('canvas');
+      document.body.appendChild(canvas);
+      const r = new CanvasRenderer(canvas, {
+        fontSize: 15,
+        fontFamily: 'monospace',
+        devicePixelRatio: 2,
+        ...opts,
+      });
+      r.resize(COLS, ROWS);
+
+      // First frame is a full paint in both configurations; start counting
+      // after it so the comparison covers steady-state streaming only.
+      const first0 = makeView(0);
+      r.render(first0.buffer as never, true, 0, first0.scrollback as never, 0);
+
+      countHeight = r.getMetrics().height;
+      rowClears = 0;
+      for (let f = 1; f <= frames; f++) {
+        const v = makeView(f);
+        r.render(v.buffer as never, false, 0, v.scrollback as never, 0);
+      }
+      const painted = rowClears;
+      countHeight = 0;
+
+      const ctx = canvas.getContext('2d')!;
+      const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      return { data: Array.from(img.data), w: canvas.width, h: canvas.height, painted };
+    };
+
+    const compare = (
+      a: { data: number[]; w: number; h: number },
+      b: { data: number[]; w: number; h: number }
+    ) => {
+      if (a.w !== b.w || a.h !== b.h) return { sizeMismatch: true, diff: -1, maxDelta: -1 };
+      let diff = 0;
+      let maxDelta = 0;
+      for (let i = 0; i < a.data.length; i += 4) {
+        let d = 0;
+        for (let c = 0; c < 4; c++) d = Math.max(d, Math.abs(a.data[i + c] - b.data[i + c]));
+        if (d > 0) diff++;
+        if (d > maxDelta) maxDelta = d;
+      }
+      return {
+        sizeMismatch: false,
+        diff,
+        total: a.data.length / 4,
+        pct: ((diff / (a.data.length / 4)) * 100).toFixed(4),
+        maxDelta,
+      };
+    };
+
+    const FRAMES = 40;
+
+    // Baseline: no atlas, no blit — the original rendering path.
+    const plain = runStream({ glyphAtlas: false, scrollBlit: false }, FRAMES);
+    // Atlas only, isolating glyph rasterisation from the blit.
+    const atlasOnly = runStream({ glyphAtlas: true, scrollBlit: false }, FRAMES);
+    // Both, the shipping configuration.
+    const both = runStream({ glyphAtlas: true, scrollBlit: true }, FRAMES);
+
+    CanvasRenderingContext2D.prototype.clearRect = origClearRect;
+
+    return {
+      atlasVsPlain: compare(atlasOnly, plain),
+      bothVsPlain: compare(both, plain),
+      bothVsAtlas: compare(both, atlasOnly),
+      rowsPainted: { plain: plain.painted, atlasOnly: atlasOnly.painted, both: both.painted },
+      frames: FRAMES,
+      rows: ROWS,
+    };
+  });
+
+  console.log(JSON.stringify(result, null, 2));
+
+  // The atlas rasterises at device scale in an unscaled context rather than at
+  // CSS scale in a scaled one, so antialiasing rounds differently. A delta of a
+  // couple of levels on a channel is that rounding; anything larger would be a
+  // real positioning or colour bug.
+  expect(result.atlasVsPlain.sizeMismatch).toBe(false);
+  expect(result.atlasVsPlain.maxDelta).toBeLessThanOrEqual(2);
+
+  // The blit only ever moves already-rendered pixels, so against the atlas-only
+  // run it must be exact.
+  expect(result.bothVsAtlas.sizeMismatch).toBe(false);
+  expect(result.bothVsAtlas.maxDelta).toBe(0);
+  expect(result.bothVsAtlas.diff).toBe(0);
+
+  expect(result.bothVsPlain.maxDelta).toBeLessThanOrEqual(2);
+
+  // The blit has to actually save work: a one-row scroll should repaint a
+  // couple of rows, not the whole viewport.
+  expect(result.rowsPainted.plain).toBe(result.frames * result.rows);
+  expect(result.rowsPainted.both).toBeLessThan(result.rowsPainted.plain / 4);
+});

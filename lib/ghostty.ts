@@ -1426,6 +1426,29 @@ export class GhosttyTerminal {
     return viewport.slice(start, start + this._cols).map((cell) => ({ ...cell }));
   }
 
+  /**
+   * Get every screen row in one pass.
+   *
+   * getLine() walks the whole viewport to return a single row, so fetching
+   * rows one at a time costs O(rows^2 * cols) WASM crossings per frame. A
+   * renderer that touches more than one row should use this instead: it walks
+   * the viewport once and slices, making the same work O(rows * cols).
+   *
+   * Cells are copied out of the pool for the same reason getLine() copies —
+   * the pool is reused by the next getViewport() call, so returning
+   * references would alias whatever is fetched next.
+   */
+  getViewportLines(): (GhosttyCell[] | null)[] {
+    this.update();
+    const viewport = this.getViewport();
+    const lines = new Array<GhosttyCell[] | null>(this._rows);
+    for (let y = 0; y < this._rows; y++) {
+      const start = y * this._cols;
+      lines[y] = viewport.slice(start, start + this._cols).map((cell) => ({ ...cell }));
+    }
+    return lines;
+  }
+
   /** For compatibility with old API */
   isDirty(): boolean {
     return this.update() !== DirtyState.NONE;

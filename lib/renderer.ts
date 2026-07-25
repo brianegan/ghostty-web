@@ -10,6 +10,7 @@
  * - Dirty line optimization for 60 FPS
  */
 
+import { GlyphAtlas } from './glyph-atlas';
 import type { ITheme } from './interfaces';
 import { KITTY_PLACEHOLDER, diacriticToInt } from './kitty_diacritics';
 import type { SelectionManager } from './selection-manager';
@@ -19,6 +20,15 @@ import { CellFlags, KittyImageFormat } from './types';
 // Interface for objects that can be rendered
 export interface IRenderable {
   getLine(y: number): GhosttyCell[] | null;
+  /**
+   * Fetch every screen row in one pass. Optional: implementations that lack
+   * it fall back to per-row getLine calls.
+   *
+   * Strongly preferred when present. getLine() on the WASM terminal walks the
+   * whole viewport to return one row, so a renderer calling it per row costs
+   * O(rows^2 * cols) WASM crossings per frame.
+   */
+  getViewportLines?(): (GhosttyCell[] | null)[];
   getCursor(): { x: number; y: number; visible: boolean; style?: 'block' | 'underline' | 'bar' };
   getDimensions(): { cols: number; rows: number };
   isRowDirty(y: number): boolean;
@@ -63,6 +73,17 @@ export interface RendererOptions {
   cursorBlink?: boolean; // Default: false
   theme?: ITheme;
   devicePixelRatio?: number; // Default: window.devicePixelRatio
+  /**
+   * Cache rasterised glyphs and composite them with drawImage instead of
+   * calling fillText per cell. Default: true. Turn off to isolate the atlas
+   * when chasing a rendering artefact.
+   */
+  glyphAtlas?: boolean;
+  /**
+   * Move already-correct pixels with a single blit when the viewport scrolls,
+   * repainting only newly exposed rows. Default: true.
+   */
+  scrollBlit?: boolean;
 }
 
 export interface FontMetrics {
@@ -176,6 +197,77 @@ export class CanvasRenderer {
 
   // Viewport tracking (for scrolling)
   private lastViewportY: number = 0;
+
+  // ==========================================================================
+  // Glyph atlas
+  // ==========================================================================
+
+  private glyphAtlasEnabled: boolean;
+  /**
+   * Created lazily on first render because it needs measured font metrics,
+   * and dropped whenever the font, DPR or metrics change. Null means "not
+   * built yet or invalidated"; a disabled atlas stays in place and reports
+   * itself via isDisabled so we stop asking it for glyphs.
+   */
+  private glyphAtlas: GlyphAtlas | null = null;
+
+  // ==========================================================================
+  // Scroll blit
+  // ==========================================================================
+
+  private scrollBlitEnabled: boolean;
+
+  /**
+   * Staging bitmap for the scroll blit, used only when theme.background is
+   * translucent. There the moved rows have to *replace* the destination band
+   * rather than composite over it, and clearing the destination first would
+   * destroy the source where the two bands overlap. An opaque background needs
+   * none of this and moves pixels in a single self-copy, so this stays null in
+   * the common case. Allocated on first use.
+   */
+  private scratchCanvas: HTMLCanvasElement | null = null;
+  private scratchCtx: CanvasRenderingContext2D | null = null;
+
+  /** Cached alpha test on theme.background. Null until first probed. */
+  private backgroundOpaque: boolean | null = null;
+
+  /**
+   * Per-row content hashes describing *what is currently on the canvas*, as two
+   * independent 32-bit hashes plus a validity flag per row.
+   *
+   * Used to verify a candidate scroll shift before trusting it: a row whose
+   * hash matches its shifted predecessor is already correct once the pixels
+   * move, and a row that mismatches gets repainted.
+   *
+   * Two hashes rather than one because a collision means skipping a repaint
+   * that was needed, which shows as corrupt output. 64 bits makes that
+   * vanishingly unlikely.
+   *
+   * The invariant that matters: canvasHash[y] must describe the pixels on row
+   * y. Every repaint updates it, every blit shifts it, and anything that
+   * invalidates the bitmap wholesale clears the validity flags. Rows flagged
+   * invalid can never be retained by a blit.
+   */
+  private canvasHashA: Int32Array | null = null;
+  private canvasHashB: Int32Array | null = null;
+  private canvasHashValid: Uint8Array | null = null;
+
+  /** Current-frame hashes, compared against the canvas hashes to verify a blit. */
+  private frameHashA: Int32Array | null = null;
+  private frameHashB: Int32Array | null = null;
+
+  /**
+   * Rows containing multi-codepoint grapheme clusters. Their hash only covers
+   * the base codepoint and the cluster length, so two different clusters
+   * sharing both would hash alike. Cheaper to always repaint these rows than to
+   * resolve every cluster to a string for hashing.
+   */
+  private complexRows = new Set<number>();
+
+  /** Inputs to the scroll-shift calculation, from the frame on the canvas. */
+  private lastFlooredViewportY: number = 0;
+  private lastScrollbackLength: number = 0;
+  private lastDims: { cols: number; rows: number } | null = null;
 
   // Current buffer being rendered (for grapheme lookups)
   private currentBuffer: IRenderable | null = null;
@@ -299,6 +391,8 @@ export class CanvasRenderer {
     this.cursorBlink = options.cursorBlink ?? false;
     this.theme = { ...DEFAULT_THEME, ...options.theme };
     this.devicePixelRatio = options.devicePixelRatio ?? window.devicePixelRatio ?? 1;
+    this.glyphAtlasEnabled = options.glyphAtlas ?? true;
+    this.scrollBlitEnabled = options.scrollBlit ?? true;
 
     // Build color palette (16 ANSI colors)
     this.palette = [
@@ -336,8 +430,11 @@ export class CanvasRenderer {
   /**
    * Build a CSS font string with proper quoting for font families with spaces.
    * Example: "Fira Code, monospace" -> '"Fira Code", monospace'
+   *
+   * `sizePx` defaults to the configured font size. The glyph atlas overrides
+   * it with the device-pixel size because its context is left unscaled.
    */
-  private buildFontString(style: string = ''): string {
+  private buildFontString(style: string = '', sizePx: number = this.fontSize): string {
     // Quote font family names that contain spaces but aren't already quoted
     const quotedFamily = this.fontFamily
       .split(',')
@@ -352,7 +449,53 @@ export class CanvasRenderer {
       })
       .join(', ');
 
-    return `${style}${this.fontSize}px ${quotedFamily}`;
+    return `${style}${sizePx}px ${quotedFamily}`;
+  }
+
+  // ==========================================================================
+  // Glyph Atlas
+  // ==========================================================================
+
+  /**
+   * Drop the cached atlas. Called whenever the font, metrics or DPR change —
+   * every entry was rasterised against the old values.
+   *
+   * Not needed on a theme change: colour is part of the cache key, so stale
+   * entries are simply never looked up again. They cost atlas space until the
+   * next repack, which is cheaper than discarding glyphs that are still live.
+   */
+  private invalidateGlyphAtlas(): void {
+    this.glyphAtlas?.dispose();
+    this.glyphAtlas = null;
+  }
+
+  /**
+   * The atlas for the current font, building it on first use. Returns null when
+   * atlas rendering is off or the atlas has given up on caching, in which case
+   * callers draw text with fillText.
+   */
+  private getGlyphAtlas(): GlyphAtlas | null {
+    if (!this.glyphAtlasEnabled) return null;
+
+    if (this.glyphAtlas === null) {
+      try {
+        this.glyphAtlas = new GlyphAtlas({
+          devicePixelRatio: this.devicePixelRatio,
+          fontSize: this.fontSize,
+          buildFontString: (style, sizePx) => this.buildFontString(style, sizePx),
+          cellWidth: this.metrics.width,
+          cellHeight: this.metrics.height,
+          baseline: this.metrics.baseline,
+        });
+      } catch {
+        // No offscreen 2D context available. Fall back to fillText for the
+        // rest of this renderer's life rather than retrying every frame.
+        this.glyphAtlasEnabled = false;
+        return null;
+      }
+    }
+
+    return this.glyphAtlas.isDisabled ? null : this.glyphAtlas;
   }
 
   private measureFont(): FontMetrics {
@@ -395,6 +538,7 @@ export class CanvasRenderer {
    */
   public remeasureFont(): void {
     this.metrics = this.measureFont();
+    this.invalidateGlyphAtlas();
   }
 
   // ==========================================================================
@@ -430,6 +574,16 @@ export class CanvasRenderer {
     // Scale context to match DPI (setting canvas.width/height resets the context)
     this.ctx.scale(this.devicePixelRatio, this.devicePixelRatio);
 
+    // Resizing clears the bitmap, so the row hashes no longer describe what is
+    // on screen and the next frame must not blit against them.
+    this.invalidateScrollBlitState();
+
+    // Keep the blit scratch in step with the canvas it stages pixels for.
+    if (this.scratchCanvas) {
+      this.scratchCanvas.width = this.canvas.width;
+      this.scratchCanvas.height = this.canvas.height;
+    }
+
     // Set text rendering properties for crisp text
     this.ctx.textBaseline = 'alphabetic';
     this.ctx.textAlign = 'left';
@@ -437,6 +591,264 @@ export class CanvasRenderer {
     // Fill background after resize
     this.ctx.fillStyle = this.theme.background;
     this.ctx.fillRect(0, 0, cssWidth, cssHeight);
+  }
+
+  // ==========================================================================
+  // Scroll Blit
+  //
+  // Scrolling moves every row's content to a new row, which marks the whole
+  // viewport dirty and forces a full re-rasterisation. The pixels are almost
+  // all still correct though — they just belong somewhere else on the canvas.
+  // Moving them with one drawImage and repainting only the newly exposed rows
+  // turns an O(rows * cols) glyph pass into a single bitmap copy.
+  //
+  // The shift is derived rather than reported. Row y always displays absolute
+  // line `scrollbackLength - viewportY + y`, whether that line lives in
+  // scrollback or on screen. Holding the absolute line fixed across two frames
+  // and solving for the row it moved to gives:
+  //
+  //   shift = (viewportY - lastViewportY) - (scrollbackLength - lastLength)
+  //
+  // Positive shift moves content down the screen. Scrolling back through
+  // history raises viewportY and shifts down; output streaming at the bottom
+  // grows scrollback and shifts up. One formula covers both.
+  //
+  // The result is treated as a hypothesis, not a fact. Alternate-screen
+  // programs and scrolling regions move content without growing scrollback, so
+  // every retained row is hash-checked against its predecessor before its
+  // pixels are reused, and mismatches are repainted.
+  // ==========================================================================
+
+  /**
+   * Forget what is on the canvas, so the next frame draws in full instead of
+   * blitting. Required whenever the bitmap stops matching the recorded hashes.
+   */
+  private invalidateScrollBlitState(): void {
+    this.canvasHashValid?.fill(0);
+  }
+
+  /** Grow the hash buffers to `rows`, clearing validity if the size changed. */
+  private ensureHashBuffers(rows: number): void {
+    if (this.canvasHashValid !== null && this.canvasHashValid.length === rows) return;
+
+    this.canvasHashA = new Int32Array(rows);
+    this.canvasHashB = new Int32Array(rows);
+    this.canvasHashValid = new Uint8Array(rows);
+    this.frameHashA = new Int32Array(rows);
+    this.frameHashB = new Int32Array(rows);
+  }
+
+  /**
+   * Hash one row's rendered inputs into `a`/`b` at index `y`.
+   *
+   * The hash has to cover everything renderCellBackground and renderCellText
+   * read off a cell, or a change would slip through as a skipped repaint.
+   * Selection, hover and image state are excluded on purpose — a blit is only
+   * attempted when none of them are active.
+   *
+   * Returns true when the row holds a grapheme cluster, which the caller must
+   * treat as always-repaint: the hash sees only the base codepoint and the
+   * cluster length, so two distinct clusters sharing both would hash alike.
+   */
+  private hashRowInto(
+    line: GhosttyCell[] | null,
+    y: number,
+    a: Int32Array,
+    b: Int32Array
+  ): boolean {
+    // Two FNV-1a streams with different offset bases, mixed with different
+    // primes so they fail independently.
+    let ha = 0x811c9dc5;
+    let hb = 0x01000193;
+    let complex = false;
+
+    if (line !== null) {
+      for (let x = 0; x < line.length; x++) {
+        const cell = line[x];
+
+        // Pack the flag-ish fields and the colours into single words so each
+        // cell costs a handful of mixes rather than one per field.
+        const attrs =
+          cell.flags |
+          (cell.fgIsDefault ? 1 << 24 : 0) |
+          (cell.bgIsDefault ? 1 << 25 : 0) |
+          (cell.width << 26);
+        const fg = (cell.fg_r << 16) | (cell.fg_g << 8) | cell.fg_b;
+        const bg = (cell.bg_r << 16) | (cell.bg_g << 8) | cell.bg_b;
+
+        ha = Math.imul(ha ^ cell.codepoint, 0x01000193);
+        hb = Math.imul(hb ^ cell.codepoint, 0x85ebca6b);
+        ha = Math.imul(ha ^ fg, 0x01000193);
+        hb = Math.imul(hb ^ bg, 0x85ebca6b);
+        ha = Math.imul(ha ^ bg, 0x01000193);
+        hb = Math.imul(hb ^ fg, 0x85ebca6b);
+        ha = Math.imul(ha ^ attrs, 0x01000193);
+        hb = Math.imul(hb ^ (attrs + cell.grapheme_len), 0x85ebca6b);
+        ha = Math.imul(ha ^ cell.hyperlink_id, 0x01000193);
+        hb = Math.imul(hb ^ cell.hyperlink_id, 0x85ebca6b);
+
+        if (cell.grapheme_len > 0) complex = true;
+      }
+    }
+
+    a[y] = ha | 0;
+    b[y] = hb | 0;
+    return complex;
+  }
+
+  /** Record that row `y` now shows the content hashed into the frame buffers. */
+  private commitRowHash(y: number): void {
+    const fa = this.frameHashA;
+    const fb = this.frameHashB;
+    const ca = this.canvasHashA;
+    const cb = this.canvasHashB;
+    const valid = this.canvasHashValid;
+    if (!fa || !fb || !ca || !cb || !valid) return;
+
+    ca[y] = fa[y];
+    cb[y] = fb[y];
+    valid[y] = 1;
+  }
+
+  /** Lazily created staging bitmap for the blit. Null if unavailable. */
+  private getScratchCtx(): CanvasRenderingContext2D | null {
+    if (this.scratchCtx) return this.scratchCtx;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = this.canvas.width;
+    canvas.height = this.canvas.height;
+    const ctx = canvas.getContext('2d', { alpha: true });
+    if (!ctx) return null;
+
+    this.scratchCanvas = canvas;
+    this.scratchCtx = ctx;
+    return ctx;
+  }
+
+  /**
+   * Shift the recorded canvas hashes to follow a blit of `shift` rows.
+   *
+   * Rows shifted in from off-screen have no pixels behind them yet, so their
+   * validity is cleared — the caller repaints them as newly exposed rows.
+   */
+  private shiftCanvasHashes(shift: number, rows: number): void {
+    const a = this.canvasHashA;
+    const b = this.canvasHashB;
+    const valid = this.canvasHashValid;
+    if (!a || !b || !valid) return;
+
+    if (shift > 0) {
+      // Content moved down: walk from the bottom so we never overwrite a
+      // source entry before reading it.
+      for (let y = rows - 1; y >= shift; y--) {
+        a[y] = a[y - shift];
+        b[y] = b[y - shift];
+        valid[y] = valid[y - shift];
+      }
+      for (let y = 0; y < shift; y++) valid[y] = 0;
+    } else {
+      const up = -shift;
+      for (let y = 0; y < rows - up; y++) {
+        a[y] = a[y + up];
+        b[y] = b[y + up];
+        valid[y] = valid[y + up];
+      }
+      for (let y = rows - up; y < rows; y++) valid[y] = 0;
+    }
+  }
+
+  /**
+   * Move the text area down by `shift` rows (negative moves up).
+   *
+   * Staged through a scratch bitmap so the copy replaces the destination band
+   * instead of compositing over it, which matters when theme.background is
+   * translucent. Source and destination are the same size and land on integer
+   * device pixels, so nothing is resampled.
+   *
+   * Returns false when the scratch bitmap is unavailable, leaving the canvas
+   * untouched so the caller can fall back to a full repaint.
+   */
+  private blitRows(shift: number, cols: number, rows: number): boolean {
+    const dpr = this.devicePixelRatio;
+    const rowHeight = this.metrics.height * dpr;
+    const moved = rows - Math.abs(shift);
+    if (moved <= 0) return false;
+
+    // Only the text grid moves. The scrollbar gutter is redrawn every frame.
+    const width = Math.round(cols * this.metrics.width * dpr);
+    const height = Math.round(moved * rowHeight);
+    const srcY = shift > 0 ? 0 : Math.round(-shift * rowHeight);
+    const dstY = shift > 0 ? Math.round(shift * rowHeight) : 0;
+
+    if (width <= 0 || height <= 0) return false;
+
+    // Device-pixel space for the whole operation: the main context carries a
+    // DPR scale that would otherwise double-apply to these already-scaled
+    // rects.
+    this.ctx.save();
+    this.ctx.setTransform(1, 0, 0, 1, 0, 0);
+
+    if (this.isBackgroundOpaque()) {
+      // Fast path. Drawing a canvas onto itself is specified to read from a
+      // snapshot of the source, so an overlapping move is well defined. With an
+      // opaque background every destination pixel is fully covered, so
+      // source-over replaces rather than blends and no clear is needed. One
+      // copy of the moved band, and nothing else.
+      this.ctx.drawImage(this.canvas, 0, srcY, width, height, 0, dstY, width, height);
+      this.ctx.restore();
+      return true;
+    }
+
+    // Translucent background: source-over would blend the moved rows into
+    // whatever is beneath them, so the destination has to be cleared first.
+    // Clearing before copying from the same canvas would destroy the source
+    // where the bands overlap, hence the detour through a scratch bitmap.
+    const scratch = this.getScratchCtx();
+    if (!scratch || !this.scratchCanvas) {
+      this.ctx.restore();
+      return false;
+    }
+
+    scratch.clearRect(0, dstY, width, height);
+    scratch.drawImage(this.canvas, 0, srcY, width, height, 0, dstY, width, height);
+    this.ctx.clearRect(0, dstY, width, height);
+    this.ctx.drawImage(this.scratchCanvas, 0, dstY, width, height, 0, dstY, width, height);
+    this.ctx.restore();
+
+    return true;
+  }
+
+  /**
+   * Whether theme.background is fully opaque, which decides if the blit can
+   * move pixels in a single self-copy.
+   *
+   * Resolved by painting the colour and reading the alpha back, so every CSS
+   * form is handled rather than just the ones a hand-written parser expects.
+   * Cached because it only changes with the theme.
+   */
+  private isBackgroundOpaque(): boolean {
+    if (this.backgroundOpaque !== null) return this.backgroundOpaque;
+
+    let opaque = false;
+    try {
+      const probe = document.createElement('canvas');
+      probe.width = 1;
+      probe.height = 1;
+      const ctx = probe.getContext('2d', { alpha: true });
+      if (ctx) {
+        ctx.clearRect(0, 0, 1, 1);
+        ctx.fillStyle = this.theme.background;
+        ctx.fillRect(0, 0, 1, 1);
+        opaque = ctx.getImageData(0, 0, 1, 1).data[3] === 255;
+      }
+    } catch {
+      // Tainted or unavailable context. Assume translucent, which only costs
+      // the slower blit path.
+      opaque = false;
+    }
+
+    this.backgroundOpaque = opaque;
+    return opaque;
   }
 
   // ==========================================================================
@@ -471,6 +883,18 @@ export class CanvasRenderer {
     this.precomputeKittyState(buffer, dims.rows);
     const scrollbackLength = scrollbackProvider ? scrollbackProvider.getScrollbackLength() : 0;
 
+    // Whether the *caller* demanded a full repaint. Distinct from forceAll
+    // below, which also absorbs the buffer's own "everything is dirty" signal.
+    //
+    // The distinction matters for the scroll blit. Ghostty reports FULL dirty
+    // on every scroll — it relocates each row's content, so it cannot describe
+    // the change as a row set. That is precisely when the blit pays off, so a
+    // full-dirty buffer must not disqualify it; the row hashes decide instead,
+    // and they are strictly better informed than a viewport-wide flag. A
+    // caller-requested repaint is different: it means the canvas itself is
+    // untrustworthy (first frame, theme swap), so no pixels may be reused.
+    const callerForcedAll = forceAll;
+
     // Check if buffer needs full redraw (e.g., screen change between normal/alternate)
     if (buffer.needsFullRedraw?.()) {
       forceAll = true;
@@ -487,41 +911,46 @@ export class CanvasRenderer {
       forceAll = true; // Force full render after resize
     }
 
-    // Force re-render when viewport changes (scrolling)
-    if (viewportY !== this.lastViewportY) {
-      forceAll = true;
-      this.lastViewportY = viewportY;
-    }
+    // Floor viewportY once for row mapping. The scrollback/screen boundary
+    // comparison and the offset/screenRow math must use the SAME integer.
+    // During smooth scroll viewportY is fractional (e.g. 2.5); comparing rows
+    // against the raw value while indexing with the floored value read one row
+    // past the end of scrollback (returning null, leaving stale pixels) and
+    // dropped the top screen row, duplicating a line near the top of the view.
+    const flooredViewportY = Math.floor(viewportY);
 
-    // Check if cursor position changed or if blinking (need to redraw cursor line)
-    const cursorMoved =
-      cursor.x !== this.lastCursorPosition.x || cursor.y !== this.lastCursorPosition.y;
-    if (cursorMoved || this.cursorBlink) {
-      // Mark cursor lines as needing redraw
-      if (!forceAll && !buffer.isRowDirty(cursor.y)) {
-        // Need to redraw cursor line
-        const line = buffer.getLine(cursor.y);
-        if (line) {
-          this.renderLine(line, cursor.y, dims.cols);
+    // Fetch viewport rows once per frame, on demand.
+    //
+    // Screen rows come from a single bulk fetch when the buffer offers one:
+    // getLine() on the WASM terminal walks the whole viewport to return one
+    // row, so calling it per row costs O(rows^2 * cols) WASM crossings a frame.
+    // Scrollback rows are already a direct per-row grid walk, so they stay
+    // individual.
+    let screenLines: (GhosttyCell[] | null)[] | null = null;
+    const lineCache = new Array<GhosttyCell[] | null | undefined>(dims.rows);
+
+    const lineAt = (y: number): GhosttyCell[] | null => {
+      const cached = lineCache[y];
+      if (cached !== undefined) return cached;
+
+      let line: GhosttyCell[] | null = null;
+      if (flooredViewportY > 0 && y < flooredViewportY && scrollbackProvider) {
+        // Upper part of the viewport is served from scrollback.
+        line = scrollbackProvider.getScrollbackLine(scrollbackLength - flooredViewportY + y);
+      } else {
+        // Lower part (or the whole viewport when at the bottom) is the screen.
+        const screenRow = flooredViewportY > 0 ? y - flooredViewportY : y;
+        if (buffer.getViewportLines) {
+          screenLines ??= buffer.getViewportLines();
+          line = screenLines[screenRow] ?? null;
+        } else {
+          line = buffer.getLine(screenRow);
         }
       }
-      if (cursorMoved && !forceAll) {
-        // Always redraw the OLD cursor row to erase the previous cursor
-        // glyph, whether or not the row is dirty and whether or not it
-        // differs from the new cursor row (issue #122: ghost cursor
-        // persisted at the initial (0,0) position because the prior
-        // logic skipped the redraw when the row was already dirty —
-        // assuming the regular dirty pass would handle it — but the
-        // regular dirty pass only runs when buffer cells changed, not
-        // when the cursor moved across unchanged cells. A double redraw
-        // when the row is both dirty AND cursor-moved is a trivial perf
-        // cost compared to the visual correctness gain.).
-        const line = buffer.getLine(this.lastCursorPosition.y);
-        if (line) {
-          this.renderLine(line, this.lastCursorPosition.y, dims.cols);
-        }
-      }
-    }
+
+      lineCache[y] = line;
+      return line;
+    };
 
     // Check if we need to redraw selection-related lines
     const hasSelection = this.selectionManager && this.selectionManager.hasSelection();
@@ -559,30 +988,8 @@ export class CanvasRenderer {
 
     if (hyperlinkChanged) {
       // Find rows containing the old or new hovered hyperlink
-      // Must check the correct buffer based on viewportY (scrollback vs screen)
-      // Floor viewportY once: the scrollback/screen boundary and the offset math
-      // must use the same integer, otherwise fractional values (during smooth
-      // scroll) read one row past the scrollback and drop the top screen row.
-      const flooredViewportY = Math.floor(viewportY);
       for (let y = 0; y < dims.rows; y++) {
-        let line: GhosttyCell[] | null = null;
-
-        // Same logic as rendering: fetch from scrollback or screen
-        if (flooredViewportY > 0) {
-          if (y < flooredViewportY && scrollbackProvider) {
-            // This row is from scrollback
-            const scrollbackOffset = scrollbackLength - flooredViewportY + y;
-            line = scrollbackProvider.getScrollbackLine(scrollbackOffset);
-          } else {
-            // This row is from visible screen
-            const screenRow = y - flooredViewportY;
-            line = buffer.getLine(screenRow);
-          }
-        } else {
-          // At bottom - fetch from visible screen
-          line = buffer.getLine(y);
-        }
-
+        const line = lineAt(y);
         if (line) {
           for (const cell of line) {
             if (
@@ -620,6 +1027,127 @@ export class CanvasRenderer {
       this.previousHoveredLinkRange = this.hoveredLinkRange;
     }
 
+    // ========================================================================
+    // Scroll blit
+    // ========================================================================
+
+    this.ensureHashBuffers(dims.rows);
+
+    // How far content moved since the frame on the canvas. See the Scroll Blit
+    // section for the derivation.
+    const scrollShift =
+      flooredViewportY - this.lastFlooredViewportY - (scrollbackLength - this.lastScrollbackLength);
+
+    const dimsUnchanged =
+      this.lastDims !== null &&
+      this.lastDims.cols === dims.cols &&
+      this.lastDims.rows === dims.rows;
+
+    // Overlays sit in viewport coordinates on top of the text, so a blit would
+    // drag them along with the rows beneath them. They are absent during the
+    // bulk output that the blit exists to speed up, so skip the fast path
+    // rather than trying to reposition them.
+    const hasOverlays =
+      Boolean(hasSelection) ||
+      this.currentDirectPlacements.length > 0 ||
+      this.kittyVirtualPlacements.size > 0 ||
+      this.hoveredHyperlinkId > 0 ||
+      this.hoveredLinkRange !== null;
+
+    // Rows the blit could not carry over and that must be repainted.
+    const blitExposedRows = new Set<number>();
+    let blitted = false;
+
+    if (
+      this.scrollBlitEnabled &&
+      !callerForcedAll &&
+      !needsResize &&
+      dimsUnchanged &&
+      !hasOverlays &&
+      scrollShift !== 0 &&
+      Math.abs(scrollShift) < dims.rows
+    ) {
+      // Hash the whole frame so retained rows can be verified against the
+      // pixels already on the canvas.
+      this.complexRows.clear();
+      for (let y = 0; y < dims.rows; y++) {
+        if (this.hashRowInto(lineAt(y), y, this.frameHashA!, this.frameHashB!)) {
+          this.complexRows.add(y);
+        }
+      }
+
+      // A retained row is only reusable when its predecessor's pixels are
+      // accounted for and hash-identical.
+      const canvasA = this.canvasHashA!;
+      const canvasB = this.canvasHashB!;
+      const canvasValid = this.canvasHashValid!;
+      const frameA = this.frameHashA!;
+      const frameB = this.frameHashB!;
+
+      const firstRetained = Math.max(0, scrollShift);
+      const lastRetained = Math.min(dims.rows, dims.rows + scrollShift);
+
+      const mismatched: number[] = [];
+      for (let y = firstRetained; y < lastRetained; y++) {
+        const src = y - scrollShift;
+        if (
+          canvasValid[src] !== 1 ||
+          canvasA[src] !== frameA[y] ||
+          canvasB[src] !== frameB[y] ||
+          this.complexRows.has(y)
+        ) {
+          mismatched.push(y);
+        }
+      }
+
+      // Repainting most of the viewport on top of a blit costs more than just
+      // drawing the frame, so bail out when the hypothesis mostly failed.
+      const retained = lastRetained - firstRetained - mismatched.length;
+      if (retained > dims.rows / 2 && this.blitRows(scrollShift, dims.cols, dims.rows)) {
+        blitted = true;
+        this.shiftCanvasHashes(scrollShift, dims.rows);
+
+        // Newly exposed rows have no pixels behind them.
+        if (scrollShift > 0) {
+          for (let y = 0; y < scrollShift; y++) blitExposedRows.add(y);
+        } else {
+          for (let y = dims.rows + scrollShift; y < dims.rows; y++) blitExposedRows.add(y);
+        }
+        for (const y of mismatched) blitExposedRows.add(y);
+
+        // The cursor was blitted along with its row and has to be cleared from
+        // wherever it landed.
+        const movedCursorRow = this.lastCursorPosition.y + scrollShift;
+        if (movedCursorRow >= 0 && movedCursorRow < dims.rows) {
+          blitExposedRows.add(movedCursorRow);
+        }
+      }
+    }
+
+    // Preserve the pre-blit behaviour when the fast path was not taken: any
+    // viewport movement forces a full repaint.
+    if (!blitted && viewportY !== this.lastViewportY) {
+      forceAll = true;
+    }
+    this.lastViewportY = viewportY;
+
+    // The cursor is drawn over the text, so both the row it left and the row it
+    // occupies have to be repainted to erase and redraw it. Collected here and
+    // folded into rowsToRender rather than painted immediately, so nothing
+    // lands on the canvas before the blit has moved pixels around.
+    const cursorRows = new Set<number>();
+    const cursorMoved =
+      cursor.x !== this.lastCursorPosition.x || cursor.y !== this.lastCursorPosition.y;
+    if (cursorMoved || this.cursorBlink) {
+      cursorRows.add(cursor.y);
+      // Always redraw the OLD cursor row to erase the previous cursor glyph
+      // (issue #122: a ghost cursor persisted at the initial (0,0) position
+      // because the old logic skipped this redraw when the row was already
+      // dirty, but the dirty pass only runs when buffer cells changed, not
+      // when the cursor moved across unchanged cells).
+      if (cursorMoved) cursorRows.add(this.lastCursorPosition.y);
+    }
+
     // Track if anything was actually rendered
     let anyLinesRendered = false;
 
@@ -629,15 +1157,32 @@ export class CanvasRenderer {
     // adjacent rows' visual space.
     const rowsToRender = new Set<number>();
     for (let y = 0; y < dims.rows; y++) {
-      // When scrolled, always force render all lines since we're showing scrollback
-      const needsRender =
-        viewportY > 0
-          ? true
-          : forceAll ||
-            buffer.isRowDirty(y) ||
-            selectionRows.has(y) ||
-            hyperlinkRows.has(y) ||
-            this.kittyDamagedRows.has(y);
+      let needsRender: boolean;
+      if (blitted) {
+        // Every row is either hash-verified against the pixels the blit moved
+        // into place or already collected in blitExposedRows, so that set is
+        // complete coverage.
+        //
+        // Deliberately ignores buffer.isRowDirty here. Scrolling relocates
+        // every row's content and so marks the whole viewport dirty; honouring
+        // that would repaint all of it and leave the blit doing no work at all.
+        // The hash is the stronger signal — it compares actual content against
+        // what is on the canvas, rather than reporting that something changed
+        // somewhere in the row.
+        needsRender = blitExposedRows.has(y) || cursorRows.has(y) || this.kittyDamagedRows.has(y);
+      } else if (viewportY > 0) {
+        // Showing scrollback, where the buffer's per-row dirty flags describe
+        // the screen rather than the view, so they cannot be trusted.
+        needsRender = true;
+      } else {
+        needsRender =
+          forceAll ||
+          buffer.isRowDirty(y) ||
+          selectionRows.has(y) ||
+          hyperlinkRows.has(y) ||
+          cursorRows.has(y) ||
+          this.kittyDamagedRows.has(y);
+      }
 
       if (needsRender) {
         rowsToRender.add(y);
@@ -647,14 +1192,6 @@ export class CanvasRenderer {
       }
     }
 
-    // Floor viewportY once for row mapping. The scrollback/screen boundary
-    // comparison and the offset/screenRow math must use the SAME integer.
-    // During smooth scroll viewportY is fractional (e.g. 2.5); comparing rows
-    // against the raw value while indexing with the floored value read one row
-    // past the end of scrollback (returning null, leaving stale pixels) and
-    // dropped the top screen row, duplicating a line near the top of the view.
-    const flooredViewportY = Math.floor(viewportY);
-
     // Render each line
     for (let y = 0; y < dims.rows; y++) {
       if (!rowsToRender.has(y)) {
@@ -663,34 +1200,19 @@ export class CanvasRenderer {
 
       anyLinesRendered = true;
 
-      // Fetch line from scrollback or visible screen
-      let line: GhosttyCell[] | null = null;
-      if (flooredViewportY > 0) {
-        // Scrolled up - need to fetch from scrollback + visible screen
-        // When scrolled up N lines, we want to show:
-        // - Scrollback lines (from the end) + visible screen lines
-
-        // Check if this row should come from scrollback or visible screen
-        if (y < flooredViewportY && scrollbackProvider) {
-          // This row is from scrollback (upper part of viewport)
-          // Get from end of scrollback buffer
-          const scrollbackOffset = scrollbackLength - flooredViewportY + y;
-          line = scrollbackProvider.getScrollbackLine(scrollbackOffset);
-        } else {
-          // This row is from visible screen (lower part of viewport)
-          const screenRow = y - flooredViewportY;
-          line = buffer.getLine(screenRow);
-        }
-      } else {
-        // At bottom - fetch from visible screen
-        line = buffer.getLine(y);
-      }
-
+      const line = lineAt(y);
       if (line) {
         this.renderLine(line, y, dims.cols);
       }
-    }
 
+      // Record what this row now shows so the next frame can decide whether
+      // its pixels are reusable. Rows painted on a frame that did not hash
+      // everything need their hash computed here.
+      if (!blitted) {
+        this.hashRowInto(line, y, this.frameHashA!, this.frameHashB!);
+      }
+      this.commitRowHash(y);
+    }
     // Selection highlighting is now integrated into renderCellBackground/renderCellText
     // No separate overlay pass needed - this fixes z-order issues with complex glyphs
 
@@ -726,6 +1248,11 @@ export class CanvasRenderer {
 
     // Update last cursor position
     this.lastCursorPosition = { x: cursor.x, y: cursor.y };
+
+    // Record the inputs the next frame's scroll shift is derived from.
+    this.lastFlooredViewportY = flooredViewportY;
+    this.lastScrollbackLength = scrollbackLength;
+    this.lastDims = { cols: dims.cols, rows: dims.rows };
 
     // ALWAYS clear dirty flags after rendering, regardless of forceAll.
     // This is critical - if we don't clear after a full redraw, the dirty
@@ -846,9 +1373,11 @@ export class CanvasRenderer {
     }
 
     // Set text style
+    const isItalic = Boolean(cell.flags & CellFlags.ITALIC);
+    const isBold = Boolean(cell.flags & CellFlags.BOLD);
     let fontStyle = '';
-    if (cell.flags & CellFlags.ITALIC) fontStyle += 'italic ';
-    if (cell.flags & CellFlags.BOLD) fontStyle += 'bold ';
+    if (isItalic) fontStyle += 'italic ';
+    if (isBold) fontStyle += 'bold ';
     this.ctx.font = this.buildFontString(fontStyle);
 
     // Extract colors and handle inverse
@@ -905,7 +1434,7 @@ export class CanvasRenderer {
     } else if (this.renderPowerlineGlyph(codepoint, cellX, cellY, cellWidth)) {
       // Powerline glyph was rendered as a vector shape, skip font rendering
     } else {
-      this.ctx.fillText(char, textX, textY);
+      this.drawGlyph(char, textX, textY, this.ctx.fillStyle as string, isBold, isItalic);
     }
 
     // Reset alpha
@@ -970,6 +1499,51 @@ export class CanvasRenderer {
         this.ctx.stroke();
       }
     }
+  }
+
+  /**
+   * Draw one glyph at a baseline origin, via the atlas when possible.
+   *
+   * Falls back to fillText when the atlas is off, has given up caching, or
+   * cannot fit the glyph. globalAlpha is left alone so the caller's faint
+   * handling applies to the blit exactly as it did to fillText.
+   */
+  private drawGlyph(
+    text: string,
+    originX: number,
+    baselineY: number,
+    color: string,
+    bold: boolean,
+    italic: boolean
+  ): void {
+    const atlas = this.getGlyphAtlas();
+    if (atlas === null) {
+      this.ctx.fillText(text, originX, baselineY);
+      return;
+    }
+
+    const glyph = atlas.get(text, color, bold, italic);
+    if (glyph === null) {
+      this.ctx.fillText(text, originX, baselineY);
+      return;
+    }
+    if (glyph.blank) return;
+
+    // Source is in device pixels; the destination is in CSS pixels because the
+    // context carries a DPR scale. Both cell edges and the glyph offsets are
+    // whole device pixels, so the blit maps 1:1 and nothing is resampled.
+    const dpr = this.devicePixelRatio;
+    this.ctx.drawImage(
+      atlas.bitmap,
+      glyph.sx,
+      glyph.sy,
+      glyph.sw,
+      glyph.sh,
+      originX + glyph.dx / dpr,
+      baselineY + glyph.dy / dpr,
+      glyph.sw / dpr,
+      glyph.sh / dpr
+    );
   }
 
   /**
@@ -1767,6 +2341,12 @@ export class CanvasRenderer {
       this.theme.brightCyan,
       this.theme.brightWhite,
     ];
+
+    // Cells that use the default fg/bg resolve their colour from the theme at
+    // paint time, so their pixels change while their hashed content does not.
+    // Drop the blit state so no stale-themed row gets reused.
+    this.invalidateScrollBlitState();
+    this.backgroundOpaque = null;
   }
 
   /**
@@ -1775,6 +2355,8 @@ export class CanvasRenderer {
   public setFontSize(size: number): void {
     this.fontSize = size;
     this.metrics = this.measureFont();
+    this.invalidateGlyphAtlas();
+    this.invalidateScrollBlitState();
   }
 
   /**
@@ -1783,6 +2365,8 @@ export class CanvasRenderer {
   public setFontFamily(family: string): void {
     this.fontFamily = family;
     this.metrics = this.measureFont();
+    this.invalidateGlyphAtlas();
+    this.invalidateScrollBlitState();
   }
 
   /**
@@ -1969,6 +2553,7 @@ export class CanvasRenderer {
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
     this.ctx.fillStyle = this.theme.background;
     this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+    this.invalidateScrollBlitState();
   }
 
   /**
@@ -1976,5 +2561,13 @@ export class CanvasRenderer {
    */
   public dispose(): void {
     this.stopCursorBlink();
+    this.invalidateGlyphAtlas();
+
+    if (this.scratchCanvas) {
+      this.scratchCanvas.width = 0;
+      this.scratchCanvas.height = 0;
+      this.scratchCanvas = null;
+      this.scratchCtx = null;
+    }
   }
 }
