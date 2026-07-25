@@ -117,6 +117,12 @@ export class Terminal extends TerminalCore {
   private currentHoveredLink?: ILink;
   private mouseMoveThrottleTimeout?: number;
   private pendingMouseMove?: MouseEvent;
+  // Where the pointer last was, and the view it was resolved against. Hover is
+  // computed from mouse movement, but the content under a stationary pointer
+  // moves too: scrolling, and output arriving at the bottom. See
+  // refreshHoverForMovedContent().
+  private lastPointer?: { clientX: number; clientY: number };
+  private hoverResolvedAgainst = '';
 
   // Browser-specific event emitters
   private selectionChangeEmitter = new EventEmitter<void>();
@@ -1063,6 +1069,8 @@ export class Terminal extends TerminalCore {
     }
     this.syncOutputStartTime = undefined;
 
+    this.refreshHoverForMovedContent();
+
     this.renderer!.render(this.wasmTerm!, false, this.viewportY, this, this.scrollbarOpacity);
     this.renderCount++;
     this.renderEmitter.fire({ start: 0, end: this.rows - 1 });
@@ -1384,6 +1392,9 @@ export class Terminal extends TerminalCore {
   private processMouseMove(e: MouseEvent): void {
     if (!this.canvas || !this.renderer || !this.linkDetector || !this.wasmTerm) return;
 
+    this.lastPointer = { clientX: e.clientX, clientY: e.clientY };
+    this.hoverResolvedAgainst = this.hoverViewKey();
+
     const rect = this.canvas.getBoundingClientRect();
     const x = Math.floor((e.clientX - rect.left) / this.renderer.charWidth);
     const y = Math.floor((e.clientY - rect.top) / this.renderer.charHeight);
@@ -1475,7 +1486,44 @@ export class Terminal extends TerminalCore {
       });
   }
 
+  /**
+   * Identifies the view a hover result was computed against: which rows are on
+   * screen, and which generation of content is in them.
+   */
+  private hoverViewKey(): string {
+    const generation =
+      (this.wasmTerm as unknown as { contentGeneration?: number })?.contentGeneration ?? 0;
+    return `${Math.floor(this.viewportY)}|${generation}`;
+  }
+
+  /**
+   * Re-resolve the hover when the content under a stationary pointer moved.
+   *
+   * Hover was only ever updated by mousemove, so scrolling with the mouse held
+   * still left the underline drawn over whatever had scrolled into that spot,
+   * and it stayed until the pointer moved. Streaming output at the bottom does
+   * the same thing without changing viewportY at all.
+   *
+   * Only runs while something is actually hovered, which keeps it off the hot
+   * path: with no link under the cursor there is no stale highlight to correct.
+   */
+  private refreshHoverForMovedContent(): void {
+    if (!this.lastPointer || !this.renderer) return;
+
+    const hovering =
+      this.currentHoveredLink !== undefined ||
+      (this.renderer as unknown as { hoveredHyperlinkId?: number }).hoveredHyperlinkId ||
+      (this.renderer as unknown as { hoveredLinkRange?: unknown }).hoveredLinkRange;
+    if (!hovering) return;
+
+    const key = this.hoverViewKey();
+    if (key === this.hoverResolvedAgainst) return;
+
+    this.processMouseMove(this.lastPointer as MouseEvent);
+  }
+
   private handleMouseLeave = (): void => {
+    this.lastPointer = undefined;
     if (this.renderer && this.wasmTerm) {
       const previousHyperlinkId = (this.renderer as any).hoveredHyperlinkId || 0;
       if (previousHyperlinkId > 0) {
