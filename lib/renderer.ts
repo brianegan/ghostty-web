@@ -1292,7 +1292,17 @@ export class CanvasRenderer {
         // The hash is the stronger signal — it compares actual content against
         // what is on the canvas, rather than reporting that something changed
         // somewhere in the row.
-        needsRender = blitExposedRows.has(y) || cursorRows.has(y) || this.kittyDamagedRows.has(y);
+        // hyperlinkRows carries the rows a hover just left as well as the ones
+        // it moved onto, and the row hash knows nothing about a link underline.
+        // Hovering disables the blit via hasOverlays, so the frame where the
+        // hover clears is the first one the blit runs on: without this, the
+        // rows that still have an underline painted are retained and the blit
+        // carries those pixels along with the text on every later scroll.
+        needsRender =
+          blitExposedRows.has(y) ||
+          cursorRows.has(y) ||
+          hyperlinkRows.has(y) ||
+          this.kittyDamagedRows.has(y);
       } else if (viewportY > 0) {
         // Showing scrollback, where the buffer's per-row dirty flags describe
         // the screen rather than the view, so they cannot be trusted.
