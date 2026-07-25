@@ -398,3 +398,110 @@ test('scroll blit is exact while a selection is being dragged', async ({ page })
   // far more. What matters is that a full repaint is no longer guaranteed.
   expect(result.painted.on).toBeLessThan(result.painted.off * 0.8);
 });
+
+// Hovering a link disables the blit (hasOverlays), so the frame where the hover
+// clears is the first frame the blit runs on. The row hash covers cell content,
+// not whether a link underline is painted over it, so those rows were retained
+// with the underline still on them and the blit then carried those pixels along
+// with the text on every later scroll. The underline ended up glued a row below
+// the link and stayed there.
+test('clearing a hovered link underline survives the blit', async ({ page }) => {
+  page.on('pageerror', (e) => console.error('PAGE ERROR:', e.message));
+  await page.goto('/demo/', { waitUntil: 'networkidle' });
+
+  const result = await page.evaluate(async () => {
+    const { CanvasRenderer } = await import('/lib/renderer.ts');
+
+    const COLS = 40;
+    const ROWS = 10;
+    const TOTAL = 100;
+
+    const mk = (ch: string) => ({
+      codepoint: ch.codePointAt(0) ?? 32,
+      fg_r: 212, fg_g: 212, fg_b: 212,
+      bg_r: 30, bg_g: 30, bg_b: 30,
+      fgIsDefault: true, bgIsDefault: true,
+      flags: 0, width: 1, hyperlink_id: 0, grapheme_len: 0,
+    });
+    type Cell = ReturnType<typeof mk>;
+
+    const corpus: Cell[][] = [];
+    for (let n = 0; n < TOTAL; n++) {
+      corpus.push([...`row ${n} `.padEnd(COLS, 'xyz').slice(0, COLS)].map(mk));
+    }
+
+    const makeView = (first: number) => {
+      const screen: Cell[][] = [];
+      for (let y = 0; y < ROWS; y++) screen.push(corpus[first + y] ?? []);
+      return {
+        buffer: {
+          getLine: (y: number) => screen[y] ?? null,
+          getViewportLines: () => screen.slice(),
+          getCursor: () => ({ x: 0, y: 0, visible: false }),
+          getDimensions: () => ({ cols: COLS, rows: ROWS }),
+          isRowDirty: () => true,
+          needsFullRedraw: () => false,
+          clearDirty: () => {},
+          getGraphemeString: (y: number, x: number) =>
+            String.fromCodePoint(screen[y]?.[x]?.codepoint || 32),
+        },
+        scrollback: {
+          getScrollbackLength: () => first,
+          getScrollbackLine: (offset: number) => corpus[offset] ?? null,
+        },
+      };
+    };
+
+    const run = (scrollBlit: boolean) => {
+      const canvas = document.createElement('canvas');
+      document.body.appendChild(canvas);
+      const r = new CanvasRenderer(canvas, {
+        fontSize: 15, fontFamily: 'monospace', devicePixelRatio: 2,
+        glyphAtlas: true, scrollBlit,
+      });
+      r.resize(COLS, ROWS);
+
+      // Parked in scrollback with a two-row link underlined, the way a hover
+      // over a wrapped URL leaves it.
+      const v0 = makeView(50);
+      r.setHoveredLinkRange({ startX: 4, startY: 3, endX: 20, endY: 4 });
+      r.render(v0.buffer as never, true, 6, v0.scrollback as never, 0);
+
+      // The pointer has not moved, but one line of scroll puts different
+      // content under it, so the hover clears on this frame.
+      r.setHoveredLinkRange(null);
+      const v1 = makeView(51);
+      r.render(v1.buffer as never, false, 6, v1.scrollback as never, 0);
+
+      // Two more scrolls, which is where the stale pixels used to ride along.
+      for (let f = 2; f <= 3; f++) {
+        const v = makeView(51 + f - 1);
+        r.render(v.buffer as never, false, 6, v.scrollback as never, 0);
+      }
+
+      const ctx = canvas.getContext('2d')!;
+      const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      return { data: Array.from(img.data), w: canvas.width, h: canvas.height };
+    };
+
+    const off = run(false);
+    const on = run(true);
+
+    let diff = 0;
+    let maxDelta = 0;
+    for (let i = 0; i < off.data.length; i += 4) {
+      let d = 0;
+      for (let c = 0; c < 4; c++) d = Math.max(d, Math.abs(off.data[i + c] - on.data[i + c]));
+      if (d > 0) diff++;
+      if (d > maxDelta) maxDelta = d;
+    }
+    return { sizeMismatch: off.w !== on.w || off.h !== on.h, diff, maxDelta, total: off.data.length / 4 };
+  });
+
+  console.log(JSON.stringify(result, null, 2));
+
+  // A retained underline shows up here as a band of blue pixels.
+  expect(result.sizeMismatch).toBe(false);
+  expect(result.maxDelta).toBe(0);
+  expect(result.diff).toBe(0);
+});
