@@ -1032,7 +1032,12 @@ export class GhosttyTerminal {
   }
 
   /**
-   * Check if a row is soft-wrapped (continues onto the next row).
+   * Check if a row is soft-wrapped, meaning it continues the row *above* it.
+   *
+   * The flag read here is WRAP_CONTINUATION, so for a line folded across rows
+   * 0 and 1 this returns false for row 0 and true for row 1. Callers deciding
+   * where a line ends must therefore ask about the following row. Matches
+   * xterm.js's IBufferLine.isWrapped.
    *
    * Same cache discipline as isRowDirty: lazy-populated on first call after
    * update(), or as a side effect of getViewport.

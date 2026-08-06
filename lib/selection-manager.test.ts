@@ -234,6 +234,143 @@ describe('SelectionManager', () => {
       term.dispose();
     });
 
+    test('getSelection joins soft-wrapped rows without a newline', async () => {
+      if (!container) return;
+
+      // A line the terminal folded is still one line. The row break is the
+      // terminal's, not the author's, so copying it back must not invent a
+      // newline the text never had.
+      const term = await createIsolatedTerminal({ cols: 20, rows: 24 });
+      term.open(container);
+
+      const line = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmn'; // 50 chars
+      term.write(line);
+
+      const scrollbackLen = term.wasmTerm!.getScrollbackLength();
+      // 50 chars over 20 columns: rows 0-1 full, row 2 holds the last 10.
+      setSelectionAbsolute(term, 0, scrollbackLen, 9, scrollbackLen + 2);
+
+      const selMgr = (term as any).selectionManager;
+      expect(selMgr.getSelection()).toBe(line);
+
+      term.dispose();
+    });
+
+    test('getSelection keeps spaces that straddle a wrap boundary', async () => {
+      if (!container) return;
+
+      // Spaces sitting at the fold are content, not padding: the per-row trim
+      // that strips a short line's trailing cells would delete them and weld
+      // the two halves together.
+      const term = await createIsolatedTerminal({ cols: 20, rows: 24 });
+      term.open(container);
+
+      const line = `${'A'.repeat(16)}    ${'B'.repeat(4)}`; // spaces fill cols 16-19
+      term.write(line);
+
+      const scrollbackLen = term.wasmTerm!.getScrollbackLength();
+      setSelectionAbsolute(term, 0, scrollbackLen, 3, scrollbackLen + 1);
+
+      const selMgr = (term as any).selectionManager;
+      expect(selMgr.getSelection()).toBe(line);
+
+      term.dispose();
+    });
+
+    test('getSelection still trims the padding after a short line', async () => {
+      if (!container) return;
+
+      // The trim has to survive for rows that genuinely end, or selecting a
+      // full row would return the line plus a tail of blanks.
+      const term = await createIsolatedTerminal({ cols: 20, rows: 24 });
+      term.open(container);
+
+      term.write('hello\r\n');
+
+      const scrollbackLen = term.wasmTerm!.getScrollbackLength();
+      setSelectionAbsolute(term, 0, scrollbackLen, 19, scrollbackLen);
+
+      const selMgr = (term as any).selectionManager;
+      expect(selMgr.getSelection()).toBe('hello');
+
+      term.dispose();
+    });
+
+    test('getSelection keeps the newlines a real line break produced', async () => {
+      if (!container) return;
+
+      // The other half of the contract: dropping wrap newlines must not drop
+      // the ones CRLF asked for.
+      const term = await createIsolatedTerminal({ cols: 20, rows: 24 });
+      term.open(container);
+
+      term.write('one\r\ntwo\r\nthree\r\n');
+
+      const scrollbackLen = term.wasmTerm!.getScrollbackLength();
+      setSelectionAbsolute(term, 0, scrollbackLen, 19, scrollbackLen + 2);
+
+      const selMgr = (term as any).selectionManager;
+      expect(selMgr.getSelection()).toBe('one\ntwo\nthree');
+
+      term.dispose();
+    });
+
+    test('getSelection joins a wrapped line that has scrolled into scrollback', async () => {
+      if (!container) return;
+
+      // Scrollback rows carry their wrap bit through a different call than
+      // screen rows, so a line that has scrolled away needs its own cover.
+      const term = await createIsolatedTerminal({ cols: 20, rows: 5, scrollback: 1000 });
+      term.open(container);
+
+      const line = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmn'; // 50 chars
+      term.write(line);
+      // Push it clear of the screen; absolute rows 0-2 stay the line's.
+      term.write('\r\n'.repeat(20));
+
+      const scrollbackLen = term.wasmTerm!.getScrollbackLength();
+      expect(scrollbackLen).toBeGreaterThan(2); // the line really is scrollback now
+
+      setSelectionAbsolute(term, 0, 0, 9, 2);
+
+      const selMgr = (term as any).selectionManager;
+      expect(selMgr.getSelection()).toBe(line);
+
+      term.dispose();
+    });
+
+    test('getSelection joins a wrapped line straddling scrollback and screen', async () => {
+      if (!container) return;
+
+      // The nastiest case: one folded line with its head in scrollback and its
+      // tail on screen, so the two halves of the join read the wrap bit from
+      // different sources and an off-by-one in the offset would show.
+      const term = await createIsolatedTerminal({ cols: 20, rows: 5, scrollback: 1000 });
+      term.open(container);
+
+      // Four filler rows first, so the wrapped line owns absolute rows 4-6.
+      term.write('filler\r\n'.repeat(4));
+      const line = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmn'; // 50 chars
+      term.write(line);
+
+      // Scroll until the scrollback boundary falls inside the line.
+      for (let i = 0; i < 40 && term.wasmTerm!.getScrollbackLength() < 5; i++) {
+        term.write('\r\n');
+      }
+
+      const scrollbackLen = term.wasmTerm!.getScrollbackLength();
+      // Straddle confirmed: row 4 is scrollback, row 6 is not.
+      expect(scrollbackLen).toBeGreaterThan(4);
+      expect(scrollbackLen).toBeLessThanOrEqual(6);
+
+      setSelectionAbsolute(term, 0, 4, 9, 6);
+
+      const selMgr = (term as any).selectionManager;
+      expect(selMgr.getSelection()).toBe(line);
+
+      term.dispose();
+    });
+
     test('getSelection extracts text from scrollback', async () => {
       if (!container) return;
 

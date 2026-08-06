@@ -168,6 +168,10 @@ export class SelectionManager {
 
       if (!line) continue;
 
+      // Does the terminal fold this row into the next one? Decides both
+      // whether a newline follows it and whether its tail may be trimmed.
+      const foldsIntoNext = this.isWrapContinuation(absRow + 1, scrollbackLength);
+
       // Track the last non-empty column for trimming trailing spaces
       let lastNonEmpty = -1;
 
@@ -210,22 +214,44 @@ export class SelectionManager {
         }
       }
 
-      // Trim trailing spaces from each line
-      if (lastNonEmpty >= 0) {
-        lineText = lineText.substring(0, lastNonEmpty);
-      } else {
-        lineText = '';
+      // Trim trailing spaces from a row that ends a line, so selecting a full
+      // row of a short line does not drag the blank remainder along. A folded
+      // row is exempt: it runs to the last column by definition, so anything
+      // at its tail is text sitting mid-line, and trimming would weld the
+      // halves of the line together.
+      if (!foldsIntoNext) {
+        lineText = lastNonEmpty >= 0 ? lineText.substring(0, lastNonEmpty) : '';
       }
 
       text += lineText;
 
-      // Add newline between rows (but not after the last row)
-      if (absRow < endAbsRow) {
+      // Add a newline between rows, but only where the text actually had one.
+      // A row the terminal folded is the same line continued, so ending it
+      // here would hand back a break the author never typed.
+      if (absRow < endAbsRow && !foldsIntoNext) {
         text += '\n';
       }
     }
 
     return text;
+  }
+
+  /**
+   * Whether an absolute row continues the row above it because the terminal
+   * folded a long line, rather than beginning a line of its own.
+   *
+   * The bit behind both calls is WRAP_CONTINUATION, so it answers "does this
+   * row continue the previous one", not "does this row wrap onto the next".
+   * That is why the caller asks about the *following* row before deciding to
+   * end a line. Reading it the other way round would strip the newline from
+   * every line except the wrapped ones. The scrollback and screen split
+   * mirrors Buffer.getLine().
+   */
+  private isWrapContinuation(absRow: number, scrollbackLength: number): boolean {
+    if (absRow < scrollbackLength) {
+      return this.wasmTerm.isScrollbackRowWrapped(absRow);
+    }
+    return this.wasmTerm.isRowWrapped(absRow - scrollbackLength);
   }
 
   /**
